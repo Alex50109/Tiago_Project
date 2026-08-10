@@ -1,0 +1,10 @@
+# GOAL
+float32 x
+float32 y
+---
+# RESULT
+---
+# FEEDBACK
+int32 image_id
+# TODO: add position and yaw angle
+sensor_msgs/Image image_data
