@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 
 import rospy
-from geometry_msgs.msg import Twist
 import math
 import actionlib
-from tiago_project.msg import ControllerSpinAction, ControllerSpinActionFeedback, ControllerNavigateAction, ControllerNavigateActionFeedback
+from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Image
+from tiago_project.msg import ControllerSpinAction, ControllerSpinFeedback
+from tiago_project.msg import ControllerNavigateAction, ControllerNavigateFeedback
 
 class Controller:
     def __init__(self):
@@ -41,21 +42,21 @@ class Controller:
 
         self.busy = True
 
-        rospy.loginfo(f"Starting work: Take {goal.num_pictures} pictures every {goal.angle_step}.")
+        rospy.loginfo(f"Starting work: Take {goal.num_pictures} pictures every {goal.step_angle}.")
 
-        angle_step_rad = math.radians(goal.angle_step)
+        step_angle_rad = math.radians(goal.step_angle)
         angular_speed = 0.5
-        rotation_time = angle_step_rad / angular_speed
+        rotation_time = step_angle_rad / angular_speed
 
         rate = rospy.Rate(10)
 
-        feedback = ControllerSpinActionFeedback()
+        feedback = ControllerSpinFeedback()
 
-        for i in range(8):
+        for i in range(goal.num_pictures):
             if self.spin_server.is_preempt_requested():
                 self.spin_server.set_preempted()
                 rospy.loginfo("Spin preempted!")
-                return
+                break
 
             # Pause for 1 second to let the camera physically stabilize before the next shot
             rospy.sleep(1.0)
@@ -75,6 +76,8 @@ class Controller:
             except rospy.ROSException:
                 rospy.logwarn("Timeout! Failed to get image from {}".format(self.camera_topic))
 
+
+            # TODO: Implement more accurate rotation using odometry
             rospy.loginfo("Rotating...")
             vel_msg = Twist()
             vel_msg.angular.z = angular_speed
