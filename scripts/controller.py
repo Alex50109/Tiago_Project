@@ -42,7 +42,8 @@ class Controller:
 
         self.busy = True
 
-        rospy.loginfo(f"Starting work: Take {goal.num_pictures} pictures every {goal.step_angle}.")
+        # Python 2 compatibility: replaced f-string with .format()
+        rospy.loginfo("Starting work: Take {} pictures every {}.".format(goal.num_pictures, goal.step_angle))
 
         step_angle_rad = math.radians(goal.step_angle)
         angular_speed = 0.5
@@ -61,7 +62,7 @@ class Controller:
             # Pause for 1 second to let the camera physically stabilize before the next shot
             rospy.sleep(1.0)
 
-            current_angle_deg = i * goal.angle_step
+            current_angle_deg = i * goal.step_angle
             rospy.loginfo("Taking picture {}/{} at {} degrees...".format(i+1, goal.num_pictures, current_angle_deg))
 
             try:
@@ -104,7 +105,8 @@ class Controller:
 
         self.busy = True
 
-        rospy.loginfo(f"Starting work: Sailing to [{goal.x}, {goal.y}].")
+        # Python 2 compatibility: replaced f-string with .format()
+        rospy.loginfo("Starting work: Sailing to [{}, {}].".format(goal.x, goal.y))
 
         # TODO: Implement navigation
         rospy.sleep(1.0)

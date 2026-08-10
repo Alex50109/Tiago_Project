@@ -6,5 +6,5 @@ float32 step_angle
 ---
 # FEEDBACK
 int32 image_id
-# TODO: add position and yaw angle
+# TODO: add position, yaw angle and depth image
 sensor_msgs/Image image_data
