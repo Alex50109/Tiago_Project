@@ -1,19 +1,26 @@
 #!/usr/bin/env python
 
+import sys
+import base64
+import json
+import cv2
 import rospy
 import actionlib
 import cv_bridge
-import base64
-import urllib2
-import json
-import cv2
-from PIL import Image
-from io import BytesIO
+
+# Python 2 vs Python 3 URL library compatibility
+try:
+    import urllib.request as urllib_req
+    import urllib.error as urllib_err
+except ImportError:
+    import urllib2 as urllib_req
+    import urllib2 as urllib_err
+
 from tiago_project.msg import ControllerSpinAction, ControllerSpinGoal
 from tiago_project.msg import ControllerNavigateAction, ControllerNavigateGoal
 from tiago_project.prompts import prompt_instruction_parser
 
-API_URL = "http://192.168.1.162:8000/v1/chat/completions"
+API_URL = "http://10.41.2.68:8000/v1/chat/completions"
 
 class Pilot:
     def __init__(self):
@@ -101,7 +108,18 @@ def encode_image(img):
         rospy.logerr("Failed to encode image to JPEG")
         return None
 
-    return base64.b64encode(buffer.tobytes()).decode("utf-8")
+    # Handle buffer.tobytes() for newer OpenCV vs buffer.tostring() for older OpenCV versions
+    if hasattr(buffer, 'tobytes'):
+        raw_bytes = buffer.tobytes()
+    else:
+        raw_bytes = buffer.tostring()
+
+    encoded = base64.b64encode(raw_bytes)
+    
+    # Ensure it's returned as a unicode string on both Python 2 and 3
+    if isinstance(encoded, bytes):
+        return encoded.decode("utf-8")
+    return encoded
 
 def prompt_model(text, image):
     content = [{"type": "text", "text": text}]
@@ -133,13 +151,19 @@ def prompt_model(text, image):
         "Authorization": "Bearer EMPTY"  # Required by some local servers even if auth is off
     }
 
+    # Encode JSON payload to bytes for HTTP request payload compatibility
+    json_data = json.dumps(payload).encode("utf-8")
+
     # Create the HTTP request
-    request = urllib2.Request(API_URL, data=json.dumps(payload), headers=headers)
+    request = urllib_req.Request(API_URL, data=json_data, headers=headers)
 
     try:
         # Send the request and read the response
-        response = urllib2.urlopen(request)
+        response = urllib_req.urlopen(request)
         response_data = response.read()
+
+        if isinstance(response_data, bytes):
+            response_data = response_data.decode("utf-8")
 
         # Parse the JSON string back into a Python dictionary
         result = json.loads(response_data)
