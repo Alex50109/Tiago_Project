@@ -1,6 +1,7 @@
 # GOAL
-float32 x
-float32 y
+float32 target_u
+float32 target_v
+int32 image_id
 ---
 # RESULT
 ---
