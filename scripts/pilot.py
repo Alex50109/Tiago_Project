@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import threading
-import Queue
+import Queue as queue
 import base64
 import json
 import cv2
@@ -37,7 +37,7 @@ class Pilot:
         self.done_spinning = False
         self.targets = []
 
-        self.spin_image_queue = Queue.Queue(SPIN_STEPS)
+        self.spin_image_queue = queue.Queue(SPIN_STEPS)
 
     # TODO: can be structured as a service
     def execute_task(self, instructions):
@@ -256,19 +256,9 @@ def detect_targets_in_image(instructions, image):
         for item in json.loads(reply.strip()):
             box = item["box"]
 
-            true_x_min = int((box["x_min"] / 1000.0) * image_width)
-            true_y_min = int((box["y_min"] / 1000.0) * image_height)
-            true_x_max = int((box["x_max"] / 1000.0) * image_width)
-            true_y_max = int((box["y_max"] / 1000.0) * image_height)
-
             items.append({
                 "desc": item["desc"],
-                "box":  {
-                    "x_min": true_x_min,
-                    "y_min": true_y_min,
-                    "x_max": true_x_max,
-                    "y_max": true_y_max,
-                },
+                "box":  box,
             })
         return items
 
