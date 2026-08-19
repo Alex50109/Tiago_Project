@@ -35,20 +35,16 @@ TARGET OBJECT: "{}"
 ADDITIONAL DESCRIPTION: "{}"
 
 OUTPUT RULES:
-1. You must return a valid JSON array containing bounding boxes for at most 5 instances of the target found.
-2. If the target is NOT found in the image, you must return an empty array: []
-3. Do NOT include any conversational text, explanations, or markdown code blocks. Output ONLY the raw JSON array.
-4. Use absolute integer coordinates between 0 and 1000, where (0, 0) is the top-left corner and (1000, 1000) is the bottom-right corner.
+1. You must return a valid JSON array containing at most 5 instances of the target.
+2. If the target is NOT found, return an empty array: []
+3. Output ONLY the raw JSON array. No markdown code blocks, no conversational text.
+4. The "box" field MUST be a simple array of exactly 4 integers: [x_min, y_min, x_max, y_max].
+5. Use absolute integer coordinates between 0 and 1000.
 
 JSON FORMAT EXACT SCHEMA:
 [
   {{
     "desc": "Brief note on why this matches the target",
-    "box": {{
-      "x_min": 0,
-      "y_min": 0,
-      "x_max": 1000,
-      "y_max": 1000
-    }}
+    "box": [250, 300, 450, 500]
   }}
 ]"""

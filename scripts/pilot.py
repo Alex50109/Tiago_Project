@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import threading
-import queue
+import Queue
 import base64
 import json
 import cv2
@@ -37,7 +37,7 @@ class Pilot:
         self.done_spinning = False
         self.targets = []
 
-        self.spin_image_queue = queue.Queue(SPIN_STEPS)
+        self.spin_image_queue = Queue.Queue(SPIN_STEPS)
 
     # TODO: can be structured as a service
     def execute_task(self, instructions):
@@ -84,7 +84,7 @@ class Pilot:
 
                     break
 
-            except queue.Empty:
+            except Queue.Empty:
                 # If we waited 1 second and got no picture, check if the action server stopped
                 state = self.spin_client.get_state()
 
@@ -104,10 +104,12 @@ class Pilot:
             rospy.logerr("Target not found!")
             return False
 
-        true_x_min = found_target["box"]["x_min"] / 1000.0
-        true_y_min = found_target["box"]["y_min"] / 1000.0
-        true_x_max = found_target["box"]["x_max"] / 1000.0
-        true_y_max = found_target["box"]["y_max"] / 1000.0
+        x_min, y_min, x_max, y_max = found_target["box"]
+
+        true_x_min = x_min / 1000.0
+        true_y_min = y_min / 1000.0
+        true_x_max = x_max / 1000.0
+        true_y_max = y_max / 1000.0
 
         # 2. Find the center pixel for the robot to navigate to in [0, 1] range
         center_u = (true_x_min + true_x_max) / 2
