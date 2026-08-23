@@ -16,8 +16,10 @@ from tiago_project.msg import ControllerSpinAction, ControllerSpinGoal
 from tiago_project.msg import ControllerNavigateAction, ControllerNavigateGoal
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
 
-VLM_API_URL = "http://192.168.1.101:8000/v1/chat/completions"
-DEPTH_SERVER_URL = "http://localhost:5000/predict_depth_raw"
+SERVER_IP = "192.168.1.101"
+
+VLM_API_URL = "http://{}:8000/v1/chat/completions".format(SERVER_IP)
+DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
 
 SPIN_STEP_ANGLE = 45.0
 SPIN_STEPS = 8
