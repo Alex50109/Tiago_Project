@@ -64,29 +64,21 @@ class Controller:
         self.camera_info_topic = '/xtion/rgb/camera_info'
 
         rospy.loginfo("Fetching camera intrinsics from {}...".format(self.camera_info_topic))
-        try:
-            info_msg = rospy.wait_for_message(self.camera_info_topic, CameraInfo, timeout=5.0)
+        info_msg = rospy.wait_for_message(self.camera_info_topic, CameraInfo, timeout=5.0)
 
-            # Extract values from the flattened 9-element K matrix
-            self.camera_info = {
-                "fx": info_msg.K[0],
-                "cx": info_msg.K[2],
-                "fy": info_msg.K[4],
-                "cy": info_msg.K[5],
-            }
+        # Extract values from the flattened 9-element K matrix
+        self.camera_info = {
+            "fx": info_msg.K[0],
+            "cx": info_msg.K[2],
+            "fy": info_msg.K[4],
+            "cy": info_msg.K[5],
+            "width": info_msg.width,
+            "height": info_msg.width,
+        }
 
-            rospy.loginfo("Camera intrinsics locked: fx={:.1f}, fy={:.1f}, cx={:.1f}, cy={:.1f}".format(
-                self.camera_info["fx"], self.camera_info["fy"], self.camera_info["cx"], self.camera_info["cy"]))
-
-        except rospy.ROSException:
-            rospy.logerr("Failed to get camera_info! Falling back to TIAGo defaults.")
-
-            self.camera_info = {
-                "fx": 525.0,
-                "cx": 319.5,
-                "fy": 525.0,
-                "cy": 239.5,
-            }
+        rospy.loginfo("Camera intrinsics locked: fx={:.1f}, fy={:.1f}, cx={:.1f}, cy={:.1f}, width={}, height={}".format(
+            self.camera_info["fx"], self.camera_info["fy"], self.camera_info["cx"], self.camera_info["cy"],
+            self.camera_info["width"], self.camera_info["height"]))
 
         self.snapshot_memory = {}
         self.bridge = cv_bridge.CvBridge()
@@ -209,59 +201,23 @@ class Controller:
             trans = snapshot['trans']
             rot = snapshot['rot']
 
-            try:
-                # Convert depth ROS message to OpenCV array
-                depth_array = self.bridge.imgmsg_to_cv2(snapshot['depth'], desired_encoding="passthrough")
-            except cv_bridge.CvBridgeError as e:
-                rospy.logerr("CvBridge Error: {}".format(e))
-                self.navigate_server.set_aborted()
-                return
+            Z = goal.depth
 
-            # Get the actual dimensions of the saved depth image
-            height, width = depth_array.shape[:2]
-
-            # Convert [0, 1] normalized floats to absolute integer pixels
-            target_u = int(goal.target_u * width)
-            target_v = int(goal.target_v * height)
-
-            # Clamp the values just in case the LLM returned exactly 1.0
-            # (which would cause an out-of-bounds array error)
-            target_u = min(max(target_u, 0), width - 1)
-            target_v = min(max(target_v, 0), height - 1)
-
-            # Get a 5x5 patch around the pixel to avoid NaN holes
-            patch = depth_array[
-                max(0, target_v-2) : min(height, target_v+3),
-                max(0, target_u-2) : min(width, target_u+3)
-            ]
-
-            # Filter valid depths
-            valid_depths = patch[(patch > 0) & (~np.isnan(patch))]
-
-            if len(valid_depths) == 0:
-                rospy.logerr("Depth sensor blind spot at this pixel! Aborting.")
-                self.navigate_server.set_aborted()
-                return
-
-            # Median distance straight out from the camera lens
-            Z = np.median(valid_depths)
-
-            # If depth is in millimeters (16UC1 format), convert to meters
-            if depth_array.dtype == np.uint16:
-                Z = Z / 1000.0
-
-            # Camera Intrinsics
             fx = self.camera_info["fx"]
             fy = self.camera_info["fy"]
             cx = self.camera_info["cx"]
             cy = self.camera_info["cy"]
+            img_w = self.camera_info["width"]
+            img_h = self.camera_info["height"]
 
-            # Pinhole model deprojection
-            X_camera = (target_u - cx) * Z / fx
-            Y_camera = (target_v - cy) * Z / fy
+            pixel_u = goal.target_u * img_w
+            pixel_v = goal.target_v * img_h
+
+            X_camera = (pixel_u - cx) * Z / fx
+            Y_camera = (pixel_v - cy) * Z / fy
             Z_camera = Z
 
-            # Apply the frozen transform
+            # Apply the transform
             matrix = tft.quaternion_matrix(rot)
             matrix[0:3, 3] = trans
 

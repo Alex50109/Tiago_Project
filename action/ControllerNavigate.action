@@ -1,6 +1,7 @@
 # GOAL
 float32 target_u
 float32 target_v
+float32 depth
 int32 image_id
 ---
 # RESULT

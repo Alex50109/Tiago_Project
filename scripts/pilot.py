@@ -9,12 +9,15 @@ import rospy
 import actionlib
 import cv_bridge
 import urllib2 as urllib_req
+import zlib
+import numpy as np
 
 from tiago_project.msg import ControllerSpinAction, ControllerSpinGoal
 from tiago_project.msg import ControllerNavigateAction, ControllerNavigateGoal
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
 
-API_URL = "http://192.168.1.101:8000/v1/chat/completions"
+VLM_API_URL = "http://192.168.1.101:8000/v1/chat/completions"
+DEPTH_SERVER_URL = "http://localhost:5000/predict_depth_raw"
 
 SPIN_STEP_ANGLE = 45.0
 SPIN_STEPS = 8
@@ -61,14 +64,17 @@ class Pilot:
         images_processed = 0
         found_target = None
         found_image_id = None
+        depth_data = None
 
         while images_processed < SPIN_STEPS and not rospy.is_shutdown():
             try:
                 image_id, image_data = self.spin_image_queue.get(timeout=1.0)
                 images_processed += 1
 
+                encoded_image = encode_image(image_data)
+
                 rospy.loginfo("Prompting picture %d!", image_id + 1)
-                result = detect_targets_in_image(target, image_data)
+                result = detect_targets_in_image(target, encoded_image)
                 rospy.loginfo("LLM returned: %s", result)
 
                 if len(result) > 0:
@@ -82,9 +88,11 @@ class Pilot:
                     else:
                         rospy.loginfo("Spin was already finished. No need to cancel.")
 
+                    depth_data = get_depth_data(encoded_image)
+
                     break
 
-            except Queue.Empty:
+            except queue.Empty:
                 # If we waited 1 second and got no picture, check if the action server stopped
                 state = self.spin_client.get_state()
 
@@ -106,18 +114,38 @@ class Pilot:
 
         x_min, y_min, x_max, y_max = found_target["box"]
 
-        true_x_min = x_min / 1000.0
-        true_y_min = y_min / 1000.0
-        true_x_max = x_max / 1000.0
-        true_y_max = y_max / 1000.0
+        true_x_min = min(max(x_min / 1000.0, 0.0), 1.0)
+        true_y_min = min(max(y_min / 1000.0, 0.0), 1.0)
+        true_x_max = min(max(x_max / 1000.0, 0.0), 1.0)
+        true_y_max = min(max(y_max / 1000.0, 0.0), 1.0)
 
-        # 2. Find the center pixel for the robot to navigate to in [0, 1] range
         center_u = (true_x_min + true_x_max) / 2
         center_v = (true_y_min + true_y_max) / 2
 
-        rospy.loginfo("Object center is at true pixel: u={}, v={}".format(center_u, center_v))
+        rospy.loginfo("Object center is at coords: u={}, v={}".format(center_u, center_v))
 
-        self.navigate_client.send_goal_and_wait(ControllerNavigateGoal(target_u = center_u, target_v = center_v, image_id=found_image_id))
+        # TODO: get depth and send it
+        depth_h, depth_w = depth_data.shape
+        pixel_x = int(center_u * (depth_w - 1))
+        pixel_y = int(center_v * (depth_h - 1))
+
+        # Sample a 5x5 window and take median to avoid noise/outliers
+        y_start = max(0, pixel_y - 2)
+        y_end = min(depth_h, pixel_y + 3)
+        x_start = max(0, pixel_x - 2)
+        x_end = min(depth_w, pixel_x + 3)
+
+        patch = depth_data[y_start:y_end, x_start:x_end]
+        depth = float(np.nanmedian(patch))
+
+        rospy.loginfo("Object center is at {:.2f} meters distance".format(depth))
+
+        self.navigate_client.send_goal_and_wait(ControllerNavigateGoal(
+            target_u = center_u,
+            target_v = center_v,
+            depth = depth,
+            image_id=found_image_id
+        ))
 
         return True
 
@@ -159,18 +187,18 @@ def encode_image(img):
     else:
         raw_bytes = buffer.tostring()
 
-    encoded = base64.b64encode(raw_bytes)
-
-    # Ensure it's returned as a unicode string on both Python 2 and 3
-    if isinstance(encoded, bytes):
-        return encoded.decode("utf-8")
-    return encoded
+    return raw_bytes
 
 def prompt_model(text, image):
     content = [{"type": "text", "text": text}]
 
     if image is not None:
-        base64_image = encode_image(image)
+        base64_image = base64.b64encode(image)
+
+        # Ensure it's returned as a unicode string on both Python 2 and 3
+        if isinstance(base64_image, bytes):
+            base64_image = base64_image.decode("utf-8")
+
         content.append({
             "type": "image_url",
             "image_url": {
@@ -200,7 +228,7 @@ def prompt_model(text, image):
     json_data = json.dumps(payload).encode("utf-8")
 
     # Create the HTTP request
-    request = urllib_req.Request(API_URL, data=json_data, headers=headers)
+    request = urllib_req.Request(VLM_API_URL, data=json_data, headers=headers)
 
     try:
         # Send the request and read the response
@@ -266,6 +294,23 @@ def detect_targets_in_image(instructions, image):
         # This catches JSON parsing errors if the LLM hallucinates bad formatting
         rospy.logerr("Failed to parse JSON from LLM. Raw output was: %s", reply)
         return None
+
+def get_depth_data(image):
+    req = urllib_req.Request(DEPTH_SERVER_URL, data=image)
+    req.add_header('Content-Type', 'application/octet-stream')
+    req.add_header('Content-Length', str(len(image)))
+
+    response = urllib_req.urlopen(req)
+
+    h = int(response.headers.get('X-Depth-Height'))
+    w = int(response.headers.get('X-Depth-Width'))
+
+    compressed_data = response.read()
+    raw_bytes = zlib.decompress(compressed_data)
+
+    depth_map = np.fromstring(raw_bytes, dtype=np.float32).reshape((h, w))
+
+    return depth_map
 
 if __name__ == '__main__':
     rospy.init_node('pilot_interface', anonymous=True)
