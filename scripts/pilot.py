@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
-import threading
-import Queue as queue
+import queue
 import base64
 import json
 import cv2
@@ -16,7 +15,7 @@ from tiago_project.msg import ControllerSpinAction, ControllerSpinGoal
 from tiago_project.msg import ControllerNavigateAction, ControllerNavigateGoal
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
 
-SERVER_IP = "192.168.1.101"
+SERVER_IP = "192.168.1.102"
 
 VLM_API_URL = "http://{}:8000/v1/chat/completions".format(SERVER_IP)
 DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
@@ -37,6 +36,13 @@ class Pilot:
         self.navigate_client.wait_for_server()
 
         rospy.loginfo("Controller linked. Ready to command!")
+
+        self.is_sim = rospy.get_param('/use_sim_time', False)
+
+        if self.is_sim:
+            rospy.loginfo("I am running in a simulation (or playing a rosbag).")
+        else:
+            rospy.loginfo("I am running on the real physical robot.")
 
         self.task_prompt = None
         self.done_spinning = False
@@ -66,7 +72,7 @@ class Pilot:
         images_processed = 0
         found_target = None
         found_image_id = None
-        depth_data = None
+        found_encoded_image = None
 
         while images_processed < SPIN_STEPS and not rospy.is_shutdown():
             try:
@@ -90,8 +96,6 @@ class Pilot:
                     else:
                         rospy.loginfo("Spin was already finished. No need to cancel.")
 
-                    depth_data = get_depth_data(encoded_image)
-
                     break
 
             except queue.Empty:
@@ -105,10 +109,6 @@ class Pilot:
 
                 # Otherwise, it's just taking a while. Loop around and wait again.
                 continue
-
-        if not self.spin_client.wait_for_result():
-            rospy.logerr("Spinning failed for some obscure reason!")
-            return False
 
         if found_target is None:
             rospy.logerr("Target not found!")
@@ -126,21 +126,33 @@ class Pilot:
 
         rospy.loginfo("Object center is at coords: u={}, v={}".format(center_u, center_v))
 
-        # TODO: get depth and send it
-        depth_h, depth_w = depth_data.shape
-        pixel_x = int(center_u * (depth_w - 1))
-        pixel_y = int(center_v * (depth_h - 1))
+        if not self.is_sim:
+            depth_data = get_depth_data(found_encoded_image)
 
-        # Sample a 5x5 window and take median to avoid noise/outliers
-        y_start = max(0, pixel_y - 2)
-        y_end = min(depth_h, pixel_y + 3)
-        x_start = max(0, pixel_x - 2)
-        x_end = min(depth_w, pixel_x + 3)
+            # TODO: get depth and send it
+            depth_h, depth_w = depth_data.shape
+            pixel_x = int(center_u * (depth_w - 1))
+            pixel_y = int(center_v * (depth_h - 1))
 
-        patch = depth_data[y_start:y_end, x_start:x_end]
-        depth = float(np.nanmedian(patch))
+            # Sample a 5x5 window and take median to avoid noise/outliers
+            y_start = max(0, pixel_y - 2)
+            y_end = min(depth_h, pixel_y + 3)
+            x_start = max(0, pixel_x - 2)
+            x_end = min(depth_w, pixel_x + 3)
+
+            patch = depth_data[y_start:y_end, x_start:x_end]
+            depth = float(np.nanmedian(patch))
+        else:
+            # if we are in the simulator we don't need to care about longer distances
+            depth = 0.0
 
         rospy.loginfo("Object center is at {:.2f} meters distance".format(depth))
+
+        # Wait for spinning to finish
+        self.spin_client.wait_for_result()
+
+        # Sleep a bit to ensure the controller is not busy (a bit hacky)
+        rospy.sleep(0.5)
 
         self.navigate_client.send_goal_and_wait(ControllerNavigateGoal(
             target_u = center_u,

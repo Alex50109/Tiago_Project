@@ -15,6 +15,7 @@ from tiago_project.msg import ControllerSpinAction, ControllerSpinFeedback
 from tiago_project.msg import ControllerNavigateAction, ControllerNavigateFeedback
 from tf.transformations import euler_from_quaternion
 from nav_msgs.msg import Odometry
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 
 class OdomTracker:
     def __init__(self):
@@ -58,6 +59,10 @@ class Controller:
         )
         self.navigate_server.start()
         self.odom_tracker = OdomTracker()
+
+        self.nav_client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        rospy.loginfo("Waiting for move_base...")
+        self.nav_client.wait_for_server()
 
         self.camera_topic = '/xtion/rgb/image_raw'
         self.depth_topic = '/xtion/depth_registered/image_raw'
@@ -175,10 +180,11 @@ class Controller:
 
             rospy.loginfo("Work is done here! Spinned enough! Me no busy!")
 
+            self.spin_server.set_succeeded()
+
         finally:
             with self.state_lock:
                 self.busy = False
-            self.spin_server.set_succeeded()
 
     def navigate_callback(self, goal):
         with self.state_lock:
@@ -202,6 +208,44 @@ class Controller:
             rot = snapshot['rot']
 
             Z = goal.depth
+
+            # if depth is close, fallback to the depth image
+            if Z < 2.0:
+                try:
+                    # Convert depth ROS message to OpenCV array
+                    depth_array = self.bridge.imgmsg_to_cv2(snapshot['depth'], desired_encoding="passthrough")
+                except cv_bridge.CvBridgeError as e:
+                    rospy.logerr("CvBridge Error: {}".format(e))
+                    self.navigate_server.set_aborted()
+                    return
+
+                # Get the actual dimensions of the saved depth image
+                height, width = depth_array.shape[:2]
+
+                # Convert [0, 1] normalized floats to absolute integer pixels
+                target_u = int(goal.target_u * (width - 1))
+                target_v = int(goal.target_v * (height - 1))
+
+                # Get a 5x5 patch around the pixel to avoid NaN holes
+                patch = depth_array[
+                    max(0, target_v-2) : min(height, target_v+3),
+                    max(0, target_u-2) : min(width, target_u+3)
+                ]
+
+                # Filter valid depths
+                valid_depths = patch[(patch > 0) & (~np.isnan(patch))]
+
+                if len(valid_depths) == 0:
+                    rospy.logerr("Depth sensor blind spot at this pixel! Aborting.")
+                    self.navigate_server.set_aborted()
+                    return
+
+                # Median distance straight out from the camera lens
+                Z = np.median(valid_depths)
+
+                # If depth is in millimeters (16UC1 format), convert to meters
+                if depth_array.dtype == np.uint16:
+                    Z = Z / 1000.0
 
             fx = self.camera_info["fx"]
             fy = self.camera_info["fy"]
@@ -231,15 +275,84 @@ class Controller:
 
             rospy.loginfo("Starting work: Sailing to [{:.2f}, {:.2f}].".format(target_x, target_y))
 
-            # TODO: Implement actual navigation driving here
-            rospy.sleep(1.0)
+            # Calculate the safe 0.5m stopping coordinate
+            robot_x, robot_y = self.get_robot_pose()
+            if robot_x is None:
+                return
 
-            rospy.loginfo("Work is done here! Got sea sick! Me no busy!")
+            dx = target_x - robot_x
+            dy = target_y - robot_y
+            distance_to_target = math.hypot(dx, dy)
+            yaw_angle = math.atan2(dy, dx) # Angle pointing from robot to object
+
+            STANDOFF_DIST = 0.5
+
+            if distance_to_target <= STANDOFF_DIST:
+                rospy.loginfo("Robot is already within {}m of the target.".format(STANDOFF_DIST))
+                return
+
+            # Calculate coordinate exactly 0.5m short of the object
+            goal_x = target_x - (STANDOFF_DIST * math.cos(yaw_angle))
+            goal_y = target_y - (STANDOFF_DIST * math.sin(yaw_angle))
+
+            rospy.loginfo("Object at ({}, {}). Driving to safe standoff at ({:.2f}, {:.2f})...".format(
+                target_x, target_y, goal_x, goal_y))
+
+            # Send the Goal
+            goal = MoveBaseGoal()
+            goal.target_pose.header.frame_id = "map"
+            goal.target_pose.header.stamp = rospy.Time.now()
+            goal.target_pose.pose.position.x = goal_x
+            goal.target_pose.pose.position.y = goal_y
+
+            # Convert yaw angle so the robot is facing the object when it stops
+            q = tft.quaternion_from_euler(0, 0, yaw_angle)
+            goal.target_pose.pose.orientation.x = q[0]
+            goal.target_pose.pose.orientation.y = q[1]
+            goal.target_pose.pose.orientation.z = q[2]
+            goal.target_pose.pose.orientation.w = q[3]
+
+            self.nav_client.send_goal(goal)
+
+            rate = rospy.Rate(5)
+            while not rospy.is_shutdown() and not self.spin_server.is_preempt_requested():
+                state = self.nav_client.get_state()
+                if state in [actionlib.GoalStatus.SUCCEEDED, actionlib.GoalStatus.ABORTED, actionlib.GoalStatus.REJECTED]:
+                    break
+
+                # traj = JointTrajectory()
+                # traj.joint_names = ['head_1_joint', 'head_2_joint']
+                # point = JointTrajectoryPoint()
+                # point.positions = [0.0, -0.6] # Look forward, tilt down
+                # point.time_from_start = rospy.Duration(0.2)
+                # traj.points.append(point)
+                # head_pub.publish(traj)
+
+                rate.sleep()
+
+            # Report Status
+            state = self.nav_client.get_state()
+            self.nav_client.cancel_goal()
+            if state == actionlib.GoalStatus.SUCCEEDED:
+                rospy.loginfo("SUCCESS: Arrived 0.5m away from the object!")
+                self.navigate_server.set_succeeded()
+            else:
+                rospy.logwarn("FAILED: Target is blocked or unreachable (State code: {}).".format(state))
+                self.navigate_server.set_aborted()
 
         finally:
             with self.state_lock:
                 self.busy = False
-            self.navigate_server.set_succeeded()
+
+    def get_robot_pose(self):
+        """Gets the current X, Y position of the robot."""
+        try:
+            self.tf_listener.waitForTransform('/map', '/base_footprint', rospy.Time(0), rospy.Duration(4.0))
+            (trans, rot) = self.tf_listener.lookupTransform('/map', '/base_footprint', rospy.Time(0))
+            return trans[0], trans[1]
+        except Exception as e:
+            rospy.logerr("Could not find robot position: " + str(e))
+            return None, None
 
 
 if __name__ == '__main__':
