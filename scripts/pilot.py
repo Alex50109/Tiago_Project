@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-import queue
+import Queue as queue
 import base64
 import json
 import cv2
@@ -69,7 +69,7 @@ class Pilot:
         found_target = None
         found_image_id = None
         found_encoded_image = None
-        found_depth_msg = None
+        found_depth_data = None
 
         while images_processed < SPIN_STEPS and not rospy.is_shutdown():
             try:
@@ -86,7 +86,7 @@ class Pilot:
                     found_image_id = image_id
                     found_target = result[0]
                     found_encoded_image = encoded_image
-                    found_depth_msg = depth_data
+                    found_depth_data = depth_data
 
                     rospy.loginfo("Target found! Canceling remaining spin.")
 
@@ -124,7 +124,7 @@ class Pilot:
 
         # Convert Hardware Depth to Numpy Array
         try:
-            hw_depth_raw = bridge.imgmsg_to_cv2(found_depth_msg, desired_encoding="passthrough")
+            hw_depth_raw = bridge.imgmsg_to_cv2(found_depth_data, desired_encoding="passthrough")
         except cv_bridge.CvBridgeError as e:
             rospy.logerr("CvBridge Error: %s" % str(e))
             return False
