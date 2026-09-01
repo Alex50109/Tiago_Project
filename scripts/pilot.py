@@ -19,7 +19,10 @@ from tiago_project.algorithms import ransac_linear_regression
 SERVER_IP = "192.168.1.102"
 
 VLM_API_URL = "http://{}:8000/v1/chat/completions".format(SERVER_IP)
+
+# Port 9090 for the Non-Metric Model, Port 9000 for the OLD Metric Model
 DEPTH_SERVER_URL = "http://{}:9090/predict_depth_raw".format(SERVER_IP)
+METRIC_DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
 
 SPIN_STEP_ANGLE = 45.0
 SPIN_STEPS = 8
@@ -151,6 +154,8 @@ class Pilot:
         valid_hw_mask = (hw_roi_patch > 0.2) & (hw_roi_patch < 3.0) & (~np.isnan(hw_roi_patch))
         valid_hw_pixels = hw_roi_patch[valid_hw_mask]
 
+        depth = 0.0
+
         # The Fusion Logic
         # If at least 5% of our ROI has valid hardware depth, use it immediately
         if len(valid_hw_pixels) > (hw_roi_patch.size * 0.05):
@@ -159,31 +164,53 @@ class Pilot:
         else:
             rospy.loginfo("Hardware depth blind in bounding box. Calibrating AI depth...")
 
-            # Fetch AI Depth
-            ai_depth_map = get_depth_data(found_encoded_image)
-            # Ensure AI map matches HW map resolution for pixel-to-pixel correspondence
+            # Fetch AI Depth from NON-METRIC server
+            ai_depth_map = get_depth_data(found_encoded_image, url=DEPTH_SERVER_URL)
             ai_depth_resized = cv2.resize(ai_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
 
             # Find background anchor points across the entire image (0.5m to 3.0m)
             anchor_mask = (hw_depth > 0.5) & (hw_depth < 3.0) & (~np.isnan(hw_depth))
             hw_anchors = hw_depth[anchor_mask]
-            ai_anchors = ai_depth_resized[anchor_mask]
+
+            # INVERT THE NON-METRIC AI DEPTH TO MAKE IT METRIC-LINEAR
+            ai_raw_anchors = ai_depth_resized[anchor_mask]
+            ai_anchors = 1.0 / (ai_raw_anchors + 1e-6)
 
             # Perform RANSAC Regression
             if len(hw_anchors) > 100:
-                # ai_anchors acts as X, hw_anchors acts as Y
                 s, t = ransac_linear_regression(ai_anchors, hw_anchors, max_iters=150, threshold=0.15)
                 rospy.loginfo("Live calibration successful: scale={:.3f}, shift={:.3f}".format(s, t))
             else:
-                rospy.logwarn("Not enough hardware anchors for regression. Defaulting to raw AI metric.")
+                rospy.logwarn("Not enough hardware anchors for regression. Defaulting to scale=1.0, shift=0.0")
                 s, t = 1.0, 0.0
 
-            # Apply calibration to the median AI depth inside the bounding box ROI
+            # Apply calibration to the INVERTED median AI depth inside the bounding box ROI
             ai_roi_patch = ai_depth_resized[py_min:py_max, px_min:px_max]
-            ai_median = float(np.median(ai_roi_patch))
+            ai_raw_median = float(np.median(ai_roi_patch))
+            ai_inverted_median = 1.0 / (ai_raw_median + 1e-6)
 
-            depth = float(s * ai_median + t)
+            depth = float(s * ai_inverted_median + t)
             rospy.loginfo("Fused AI depth calculated successfully.")
+
+            # -------------------------------------------------------------
+            # TEMPORARY COMPARISON WITH OLD METRIC SERVER
+            # -------------------------------------------------------------
+            try:
+                rospy.loginfo("Fetching uncalibrated metric model for comparison...")
+                metric_depth_map = get_depth_data(found_encoded_image, url=METRIC_DEPTH_SERVER_URL)
+                metric_depth_resized = cv2.resize(metric_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
+
+                metric_roi_patch = metric_depth_resized[py_min:py_max, px_min:px_max]
+                metric_median = float(np.median(metric_roi_patch))
+
+                rospy.loginfo("\n================ DEPTH COMPARISON ================")
+                rospy.loginfo("1. Calibrated Non-Metric (RANSAC): {:.3f} meters".format(depth))
+                rospy.loginfo("2. Uncalibrated Metric (Raw AI)  : {:.3f} meters".format(metric_median))
+                rospy.loginfo("Absolute Difference              : {:.3f} meters".format(abs(depth - metric_median)))
+                rospy.loginfo("==================================================\n")
+            except Exception as e:
+                rospy.logerr("Failed to fetch from metric server for comparison: %s", str(e))
+            # -------------------------------------------------------------
 
         rospy.loginfo("Final calculated depth: {:.2f} meters".format(depth))
 
@@ -327,8 +354,8 @@ def detect_targets_in_image(instructions, image):
         rospy.logerr("Failed to parse JSON from LLM. Raw output was: %s", reply)
         return None
 
-def get_depth_data(image):
-    req = urllib_req.Request(DEPTH_SERVER_URL, data=image)
+def get_depth_data(image, url=DEPTH_SERVER_URL):
+    req = urllib_req.Request(url, data=image)
     req.add_header('Content-Type', 'application/octet-stream')
     req.add_header('Content-Length', str(len(image)))
 
@@ -347,6 +374,6 @@ if __name__ == '__main__':
     rospy.init_node('pilot_interface', anonymous=True)
 
     pilot = Pilot()
-    pilot.execute_task("Go to the bench next to a person!")
+    pilot.execute_task("Go to the boy boxes on the counter!")
 
     rospy.spin()
