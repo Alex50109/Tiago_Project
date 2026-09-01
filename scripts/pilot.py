@@ -16,7 +16,7 @@ from tiago_project.msg import ControllerNavigateAction, ControllerNavigateGoal
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
 from tiago_project.algorithms import ransac_linear_regression
 
-SERVER_IP = "192.168.1.102"
+SERVER_IP = "10.41.3.112"
 
 VLM_API_URL = "http://{}:8000/v1/chat/completions".format(SERVER_IP)
 
@@ -97,6 +97,8 @@ class Pilot:
                     else:
                         rospy.loginfo("Spin was already finished. No need to cancel.")
 
+                    found_encoded_image = encoded_image
+
                     break
 
             except queue.Empty:
@@ -148,17 +150,55 @@ class Pilot:
         py_min = max(0, int(roi_v_min * (hw_h - 1)))
         py_max = min(hw_h, max(py_min + 1, int(roi_v_max * (hw_h - 1))))
 
+        # -------------------------------------------------------------
+        # DEBUG IMAGE GENERATION: Draw Bounding Box and ROI
+        # -------------------------------------------------------------
+        try:
+            # 1. Decode the saved JPEG bytes back to a numpy BGR image
+            debug_rgb = cv2.imdecode(np.fromstring(found_encoded_image, np.uint8), cv2.IMREAD_COLOR)
+
+            # 2. Normalize and colorize the raw hardware depth map for human viewing
+            # Clip depth to 5 meters for better contrast, then scale to 0-255
+            depth_clipped = np.clip(hw_depth, 0, 5.0)
+            depth_normalized = ((depth_clipped / 5.0) * 255.0).astype(np.uint8)
+            debug_depth_color = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+
+            # Calculate the full bounding box pixel coordinates
+            bb_x_min = int(u_min * hw_w)
+            bb_x_max = int(u_max * hw_w)
+            bb_y_min = int(v_min * hw_h)
+            bb_y_max = int(v_max * hw_h)
+
+            # Draw the Full Bounding Box (Red, thick line)
+            cv2.rectangle(debug_rgb, (bb_x_min, bb_y_min), (bb_x_max, bb_y_max), (0, 0, 255), 2)
+            cv2.rectangle(debug_depth_color, (bb_x_min, bb_y_min), (bb_x_max, bb_y_max), (0, 0, 255), 2)
+
+            # Draw the Center 50% ROI Box (Green, thick line)
+            cv2.rectangle(debug_rgb, (px_min, py_min), (px_max, py_max), (0, 255, 0), 2)
+            cv2.rectangle(debug_depth_color, (px_min, py_min), (px_max, py_max), (0, 255, 0), 2)
+
+            # Save the images to disk
+            cv2.imwrite("/tmp/debug_tiago_rgb.jpg", debug_rgb)
+            cv2.imwrite("/tmp/debug_tiago_depth.jpg", debug_depth_color)
+            rospy.loginfo("Saved debug images to /tmp/debug_tiago_rgb.jpg and /tmp/debug_tiago_depth.jpg")
+
+        except Exception as e:
+            rospy.logerr("Failed to generate debug images: %s", str(e))
+        # -------------------------------------------------------------
+
         hw_roi_patch = hw_depth[py_min:py_max, px_min:px_max]
 
-        # Filter valid hardware pixels (e.g. valid between 0.2m and 3.0m)
-        valid_hw_mask = (hw_roi_patch > 0.2) & (hw_roi_patch < 3.0) & (~np.isnan(hw_roi_patch))
-        valid_hw_pixels = hw_roi_patch[valid_hw_mask]
+        # Clean NumPy approach: Get only valid hardware pixels FIRST to prevent any warnings
+        roi_finite_mask = np.isfinite(hw_roi_patch)
+        roi_finite_pixels = hw_roi_patch[roi_finite_mask]
+
+        # Filter by distance on strictly valid numbers
+        valid_hw_pixels = roi_finite_pixels[(roi_finite_pixels > 0.2) & (roi_finite_pixels < 3.0)]
 
         depth = 0.0
 
-        # The Fusion Logic
-        # If at least 5% of our ROI has valid hardware depth, use it immediately
-        if len(valid_hw_pixels) > (hw_roi_patch.size * 0.05):
+        # Require at least 30% of the patch size to trust hardware
+        if len(valid_hw_pixels) > (hw_roi_patch.size * 0.30):
             depth = float(np.median(valid_hw_pixels))
             rospy.loginfo("Hardware depth acquired successfully. Object is close.")
         else:
@@ -168,28 +208,44 @@ class Pilot:
             ai_depth_map = get_depth_data(found_encoded_image, url=DEPTH_SERVER_URL)
             ai_depth_resized = cv2.resize(ai_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
 
-            # Find background anchor points across the entire image (0.5m to 3.0m)
-            anchor_mask = (hw_depth > 0.5) & (hw_depth < 3.0) & (~np.isnan(hw_depth))
-            hw_anchors = hw_depth[anchor_mask]
+            # Clean NumPy approach for the whole image anchors
+            full_finite_mask = np.isfinite(hw_depth)
 
-            # INVERT THE NON-METRIC AI DEPTH TO MAKE IT METRIC-LINEAR
-            ai_raw_anchors = ai_depth_resized[anchor_mask]
-            ai_anchors = 1.0 / (ai_raw_anchors + 1e-6)
+            # Extract only the valid hardware pixels and their matching AI pixels
+            hw_finite = hw_depth[full_finite_mask]
+            ai_finite = ai_depth_resized[full_finite_mask]
 
-            # Perform RANSAC Regression
-            if len(hw_anchors) > 100:
-                s, t = ransac_linear_regression(ai_anchors, hw_anchors, max_iters=150, threshold=0.15)
-                rospy.loginfo("Live calibration successful: scale={:.3f}, shift={:.3f}".format(s, t))
+            # Filter by distance strictly on the finite numbers (0.5m to 3.0m)
+            dist_mask = (hw_finite > 0.5) & (hw_finite < 3.0)
+
+            hw_anchors = hw_finite[dist_mask]
+            ai_raw_anchors = ai_finite[dist_mask]
+
+            # Run regression in DISPARITY SPACE (1 / Z).
+            # Add small epsilon to prevent division by zero
+            hw_disparity_anchors = 1.0 / (hw_anchors + 1e-6)
+
+            # Perform RANSAC Regression: (1/Z_hw) = s * ai_raw + t
+            if len(hw_disparity_anchors) > 100:
+                s, t = ransac_linear_regression(ai_raw_anchors, hw_disparity_anchors, max_iters=150, threshold=0.05)
+                rospy.loginfo("Disparity calibration successful: scale={:.5f}, shift={:.5f}".format(s, t))
             else:
-                rospy.logwarn("Not enough hardware anchors for regression. Defaulting to scale=1.0, shift=0.0")
+                rospy.logwarn("Not enough hardware anchors for regression. Defaulting to safe fallback.")
                 s, t = 1.0, 0.0
 
-            # Apply calibration to the INVERTED median AI depth inside the bounding box ROI
+            # Apply calibration to the raw AI depth inside the bounding box ROI
             ai_roi_patch = ai_depth_resized[py_min:py_max, px_min:px_max]
             ai_raw_median = float(np.median(ai_roi_patch))
-            ai_inverted_median = 1.0 / (ai_raw_median + 1e-6)
 
-            depth = float(s * ai_inverted_median + t)
+            # Calculate final disparity, then invert back to metric depth
+            target_disparity = float(s * ai_raw_median + t)
+
+            # Prevent division by zero if target is theoretically at infinity
+            if target_disparity <= 0.01:
+                depth = 20.0 # Cap max distance at 20m
+            else:
+                depth = 1.0 / target_disparity
+
             rospy.loginfo("Fused AI depth calculated successfully.")
 
             # -------------------------------------------------------------
@@ -374,6 +430,6 @@ if __name__ == '__main__':
     rospy.init_node('pilot_interface', anonymous=True)
 
     pilot = Pilot()
-    pilot.execute_task("Go to the boy boxes on the counter!")
+    pilot.execute_task("Go to the sink!")
 
     rospy.spin()

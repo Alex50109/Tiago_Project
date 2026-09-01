@@ -15,7 +15,9 @@ from tiago_project.msg import ControllerSpinAction, ControllerSpinFeedback
 from tiago_project.msg import ControllerNavigateAction, ControllerNavigateFeedback
 from tf.transformations import euler_from_quaternion
 from nav_msgs.msg import Odometry
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
+from std_srvs.srv import Empty
 
 class OdomTracker:
     def __init__(self):
@@ -64,7 +66,11 @@ class Controller:
         rospy.loginfo("Waiting for move_base...")
         self.nav_client.wait_for_server()
 
-        self.camera_topic = '/xtion/rgb/image_raw'
+        self.head_pub = rospy.Publisher('/head_controller/command', JointTrajectory, queue_size=1)
+
+        self.clear_costmaps_srv = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
+
+        self.camera_topic = '/xtion/rgb/image_rect_color'
         self.depth_topic = '/xtion/depth_registered/image_raw'
         self.camera_info_topic = '/xtion/rgb/camera_info'
 
@@ -78,7 +84,7 @@ class Controller:
             "fy": info_msg.K[4],
             "cy": info_msg.K[5],
             "width": info_msg.width,
-            "height": info_msg.width,
+            "height": info_msg.height,
         }
 
         rospy.loginfo("Camera intrinsics locked: fx={:.1f}, fy={:.1f}, cx={:.1f}, cy={:.1f}, width={}, height={}".format(
@@ -98,6 +104,16 @@ class Controller:
                 self.spin_server.set_aborted()
                 return
             self.busy = True
+
+        self.clear_costmaps_srv()
+
+        traj = JointTrajectory()
+        traj.joint_names = ['head_1_joint', 'head_2_joint']
+        point = JointTrajectoryPoint()
+        point.positions = [0.0, -0.1] # Look forward, tilt down
+        point.time_from_start = rospy.Duration(0.2)
+        traj.points.append(point)
+        self.head_pub.publish(traj)
 
         try:
             rospy.loginfo("Starting work: Take {} pictures every {}.".format(goal.num_pictures, goal.step_angle))
@@ -134,9 +150,11 @@ class Controller:
                     image = rospy.wait_for_message(self.camera_topic, Image, timeout=5.0)
                     depth_image = rospy.wait_for_message(self.depth_topic, Image, timeout=5.0)
 
+                    img_time = image.header.stamp
+
                     # Grab the exact transform from Map to Camera Lens
-                    self.tf_listener.waitForTransform('/map', '/xtion_rgb_optical_frame', rospy.Time(0), rospy.Duration(1.0))
-                    (trans, rot) = self.tf_listener.lookupTransform('/map', '/xtion_rgb_optical_frame', rospy.Time(0))
+                    self.tf_listener.waitForTransform('/map', '/xtion_rgb_optical_frame', img_time, rospy.Duration(1.0))
+                    (trans, rot) = self.tf_listener.lookupTransform('/map', '/xtion_rgb_optical_frame', img_time)
 
                     self.snapshot_memory[i] = {
                         'trans': trans,
@@ -246,7 +264,7 @@ class Controller:
             distance_to_target = math.hypot(dx, dy)
             yaw_angle = math.atan2(dy, dx) # Angle pointing from robot to object
 
-            STANDOFF_DIST = 0.5
+            STANDOFF_DIST = 0
 
             if distance_to_target <= STANDOFF_DIST:
                 rospy.loginfo("Robot is already within {}m of the target.".format(STANDOFF_DIST))
@@ -281,21 +299,13 @@ class Controller:
                 if state in [actionlib.GoalStatus.SUCCEEDED, actionlib.GoalStatus.ABORTED, actionlib.GoalStatus.REJECTED]:
                     break
 
-                # traj = JointTrajectory()
-                # traj.joint_names = ['head_1_joint', 'head_2_joint']
-                # point = JointTrajectoryPoint()
-                # point.positions = [0.0, -0.6] # Look forward, tilt down
-                # point.time_from_start = rospy.Duration(0.2)
-                # traj.points.append(point)
-                # head_pub.publish(traj)
-
                 rate.sleep()
 
             # Report Status
             state = self.nav_client.get_state()
-            self.nav_client.cancel_goal()
+            # self.nav_client.cancel_goal()
             if state == actionlib.GoalStatus.SUCCEEDED:
-                rospy.loginfo("SUCCESS: Arrived 0.5m away from the object!")
+                rospy.loginfo("SUCCESS: Arrived {}m away from the object!".format(STANDOFF_DIST))
                 self.navigate_server.set_succeeded()
             else:
                 rospy.logwarn("FAILED: Target is blocked or unreachable (State code: {}).".format(state))
