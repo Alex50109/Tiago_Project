@@ -139,7 +139,6 @@ class Controller:
                     (trans, rot) = self.tf_listener.lookupTransform('/map', '/xtion_rgb_optical_frame', rospy.Time(0))
 
                     self.snapshot_memory[i] = {
-                        'depth': depth_image,
                         'trans': trans,
                         'rot': rot
                     }
@@ -148,6 +147,7 @@ class Controller:
                     # images from previous scans are also available
                     feedback.image_id = i
                     feedback.image_data = image
+                    feedback.depth_data = depth_image
                     self.spin_server.publish_feedback(feedback)
 
                     rospy.loginfo("Feedback id={} published".format(i))
@@ -207,46 +207,6 @@ class Controller:
             trans = snapshot['trans']
             rot = snapshot['rot']
 
-            Z = goal.depth
-
-            # if depth is close, fallback to the depth image
-            if Z < 2.0:
-                try:
-                    # Convert depth ROS message to OpenCV array
-                    depth_array = self.bridge.imgmsg_to_cv2(snapshot['depth'], desired_encoding="passthrough")
-                except cv_bridge.CvBridgeError as e:
-                    rospy.logerr("CvBridge Error: {}".format(e))
-                    self.navigate_server.set_aborted()
-                    return
-
-                # Get the actual dimensions of the saved depth image
-                height, width = depth_array.shape[:2]
-
-                # Convert [0, 1] normalized floats to absolute integer pixels
-                target_u = int(goal.target_u * (width - 1))
-                target_v = int(goal.target_v * (height - 1))
-
-                # Get a 5x5 patch around the pixel to avoid NaN holes
-                patch = depth_array[
-                    max(0, target_v-2) : min(height, target_v+3),
-                    max(0, target_u-2) : min(width, target_u+3)
-                ]
-
-                # Filter valid depths
-                valid_depths = patch[(patch > 0) & (~np.isnan(patch))]
-
-                if len(valid_depths) == 0:
-                    rospy.logerr("Depth sensor blind spot at this pixel! Aborting.")
-                    self.navigate_server.set_aborted()
-                    return
-
-                # Median distance straight out from the camera lens
-                Z = np.median(valid_depths)
-
-                # If depth is in millimeters (16UC1 format), convert to meters
-                if depth_array.dtype == np.uint16:
-                    Z = Z / 1000.0
-
             fx = self.camera_info["fx"]
             fy = self.camera_info["fy"]
             cx = self.camera_info["cx"]
@@ -257,6 +217,7 @@ class Controller:
             pixel_u = goal.target_u * img_w
             pixel_v = goal.target_v * img_h
 
+            Z = goal.depth
             X_camera = (pixel_u - cx) * Z / fx
             Y_camera = (pixel_v - cy) * Z / fy
             Z_camera = Z

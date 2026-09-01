@@ -7,3 +7,4 @@ float32 step_angle
 # FEEDBACK
 int32 image_id
 sensor_msgs/Image image_data
+sensor_msgs/Image depth_data

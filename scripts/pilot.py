@@ -14,11 +14,12 @@ import numpy as np
 from tiago_project.msg import ControllerSpinAction, ControllerSpinGoal
 from tiago_project.msg import ControllerNavigateAction, ControllerNavigateGoal
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
+from tiago_project.algorithms import ransac_linear_regression
 
 SERVER_IP = "192.168.1.102"
 
 VLM_API_URL = "http://{}:8000/v1/chat/completions".format(SERVER_IP)
-DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
+DEPTH_SERVER_URL = "http://{}:9090/predict_depth_raw".format(SERVER_IP)
 
 SPIN_STEP_ANGLE = 45.0
 SPIN_STEPS = 8
@@ -37,20 +38,12 @@ class Pilot:
 
         rospy.loginfo("Controller linked. Ready to command!")
 
-        self.is_sim = rospy.get_param('/use_sim_time', False)
-
-        if self.is_sim:
-            rospy.loginfo("I am running in a simulation (or playing a rosbag).")
-        else:
-            rospy.loginfo("I am running on the real physical robot.")
-
         self.task_prompt = None
         self.done_spinning = False
         self.targets = []
 
         self.spin_image_queue = queue.Queue(SPIN_STEPS)
 
-    # TODO: can be structured as a service
     def execute_task(self, instructions):
         target = parse_instructions_prompt(instructions)
         if target is None:
@@ -63,7 +56,7 @@ class Pilot:
         while True:
             try:
                 self.spin_image_queue.get_nowait()
-            except queue.Empty as e:
+            except queue.Empty:
                 break
 
         # start spinning
@@ -73,10 +66,11 @@ class Pilot:
         found_target = None
         found_image_id = None
         found_encoded_image = None
+        found_depth_msg = None
 
         while images_processed < SPIN_STEPS and not rospy.is_shutdown():
             try:
-                image_id, image_data = self.spin_image_queue.get(timeout=1.0)
+                image_id, image_data, depth_data = self.spin_image_queue.get(timeout=1.0)
                 images_processed += 1
 
                 encoded_image = encode_image(image_data)
@@ -85,8 +79,12 @@ class Pilot:
                 result = detect_targets_in_image(target, encoded_image)
                 rospy.loginfo("LLM returned: %s", result)
 
-                if len(result) > 0:
-                    found_image_id, found_target = (image_id, result[0])
+                if result is not None and len(result) > 0:
+                    found_image_id = image_id
+                    found_target = result[0]
+                    found_encoded_image = encoded_image
+                    found_depth_msg = depth_data
+
                     rospy.loginfo("Target found! Canceling remaining spin.")
 
                     current_state = self.spin_client.get_state()
@@ -99,65 +97,104 @@ class Pilot:
                     break
 
             except queue.Empty:
-                # If we waited 1 second and got no picture, check if the action server stopped
                 state = self.spin_client.get_state()
-
-                # If the server succeeded, aborted, or was preempted, it won't send more images
                 if state in [actionlib.GoalStatus.SUCCEEDED, actionlib.GoalStatus.ABORTED, actionlib.GoalStatus.PREEMPTED]:
                     rospy.logwarn("Spin action ended early. Stopping image processing.")
                     break
-
-                # Otherwise, it's just taking a while. Loop around and wait again.
                 continue
 
         if found_target is None:
             rospy.logerr("Target not found!")
             return False
 
+        # Extract normalized bounding box coordinates
         x_min, y_min, x_max, y_max = found_target["box"]
+        u_min = min(max(x_min / 1000.0, 0.0), 1.0)
+        v_min = min(max(y_min / 1000.0, 0.0), 1.0)
+        u_max = min(max(x_max / 1000.0, 0.0), 1.0)
+        v_max = min(max(y_max / 1000.0, 0.0), 1.0)
 
-        true_x_min = min(max(x_min / 1000.0, 0.0), 1.0)
-        true_y_min = min(max(y_min / 1000.0, 0.0), 1.0)
-        true_x_max = min(max(x_max / 1000.0, 0.0), 1.0)
-        true_y_max = min(max(y_max / 1000.0, 0.0), 1.0)
+        center_u = (u_min + u_max) / 2.0
+        center_v = (v_min + v_max) / 2.0
 
-        center_u = (true_x_min + true_x_max) / 2
-        center_v = (true_y_min + true_y_max) / 2
+        rospy.loginfo("Object center is at coords: u={:.3f}, v={:.3f}".format(center_u, center_v))
 
-        rospy.loginfo("Object center is at coords: u={}, v={}".format(center_u, center_v))
+        # Convert Hardware Depth to Numpy Array
+        try:
+            hw_depth_raw = bridge.imgmsg_to_cv2(found_depth_msg, desired_encoding="passthrough")
+        except cv_bridge.CvBridgeError as e:
+            rospy.logerr("CvBridge Error: %s" % str(e))
+            return False
 
-        if not self.is_sim:
-            depth_data = get_depth_data(found_encoded_image)
-
-            # TODO: get depth and send it
-            depth_h, depth_w = depth_data.shape
-            pixel_x = int(center_u * (depth_w - 1))
-            pixel_y = int(center_v * (depth_h - 1))
-
-            # Sample a 5x5 window and take median to avoid noise/outliers
-            y_start = max(0, pixel_y - 2)
-            y_end = min(depth_h, pixel_y + 3)
-            x_start = max(0, pixel_x - 2)
-            x_end = min(depth_w, pixel_x + 3)
-
-            patch = depth_data[y_start:y_end, x_start:x_end]
-            depth = float(np.nanmedian(patch))
+        # Convert 16UC1 (millimeters) to meters if necessary
+        if hw_depth_raw.dtype == np.uint16:
+            hw_depth = hw_depth_raw.astype(np.float32) / 1000.0
         else:
-            # if we are in the simulator we don't need to care about longer distances
-            depth = 0.0
+            hw_depth = hw_depth_raw.copy()
 
-        rospy.loginfo("Object center is at {:.2f} meters distance".format(depth))
+        hw_h, hw_w = hw_depth.shape
+
+        # Extract Center 50% ROI of the bounding box (ROI = region of interest)
+        roi_u_min = u_min + (u_max - u_min) * 0.25
+        roi_u_max = u_max - (u_max - u_min) * 0.25
+        roi_v_min = v_min + (v_max - v_min) * 0.25
+        roi_v_max = v_max - (v_max - v_min) * 0.25
+
+        px_min = max(0, int(roi_u_min * (hw_w - 1)))
+        px_max = min(hw_w, max(px_min + 1, int(roi_u_max * (hw_w - 1))))
+        py_min = max(0, int(roi_v_min * (hw_h - 1)))
+        py_max = min(hw_h, max(py_min + 1, int(roi_v_max * (hw_h - 1))))
+
+        hw_roi_patch = hw_depth[py_min:py_max, px_min:px_max]
+
+        # Filter valid hardware pixels (e.g. valid between 0.2m and 3.0m)
+        valid_hw_mask = (hw_roi_patch > 0.2) & (hw_roi_patch < 3.0) & (~np.isnan(hw_roi_patch))
+        valid_hw_pixels = hw_roi_patch[valid_hw_mask]
+
+        # The Fusion Logic
+        # If at least 5% of our ROI has valid hardware depth, use it immediately
+        if len(valid_hw_pixels) > (hw_roi_patch.size * 0.05):
+            depth = float(np.median(valid_hw_pixels))
+            rospy.loginfo("Hardware depth acquired successfully. Object is close.")
+        else:
+            rospy.loginfo("Hardware depth blind in bounding box. Calibrating AI depth...")
+
+            # Fetch AI Depth
+            ai_depth_map = get_depth_data(found_encoded_image)
+            # Ensure AI map matches HW map resolution for pixel-to-pixel correspondence
+            ai_depth_resized = cv2.resize(ai_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
+
+            # Find background anchor points across the entire image (0.5m to 3.0m)
+            anchor_mask = (hw_depth > 0.5) & (hw_depth < 3.0) & (~np.isnan(hw_depth))
+            hw_anchors = hw_depth[anchor_mask]
+            ai_anchors = ai_depth_resized[anchor_mask]
+
+            # Perform RANSAC Regression
+            if len(hw_anchors) > 100:
+                # ai_anchors acts as X, hw_anchors acts as Y
+                s, t = ransac_linear_regression(ai_anchors, hw_anchors, max_iters=150, threshold=0.15)
+                rospy.loginfo("Live calibration successful: scale={:.3f}, shift={:.3f}".format(s, t))
+            else:
+                rospy.logwarn("Not enough hardware anchors for regression. Defaulting to raw AI metric.")
+                s, t = 1.0, 0.0
+
+            # Apply calibration to the median AI depth inside the bounding box ROI
+            ai_roi_patch = ai_depth_resized[py_min:py_max, px_min:px_max]
+            ai_median = float(np.median(ai_roi_patch))
+
+            depth = float(s * ai_median + t)
+            rospy.loginfo("Fused AI depth calculated successfully.")
+
+        rospy.loginfo("Final calculated depth: {:.2f} meters".format(depth))
 
         # Wait for spinning to finish
         self.spin_client.wait_for_result()
-
-        # Sleep a bit to ensure the controller is not busy (a bit hacky)
         rospy.sleep(0.5)
 
         self.navigate_client.send_goal_and_wait(ControllerNavigateGoal(
-            target_u = center_u,
-            target_v = center_v,
-            depth = depth,
+            target_u=center_u,
+            target_v=center_v,
+            depth=depth,
             image_id=found_image_id
         ))
 
@@ -165,15 +202,12 @@ class Pilot:
 
     def spin_feedback_callback(self, feedback):
         rospy.loginfo("Pilot received picture %d!", feedback.image_id + 1)
-        rospy.loginfo("Image data size: %d bytes.", len(feedback.image_data.data))
-
-        self.spin_image_queue.put((feedback.image_id, feedback.image_data))
+        self.spin_image_queue.put((feedback.image_id, feedback.image_data, feedback.depth_data))
 
 bridge = cv_bridge.CvBridge()
 
 def encode_image(img):
     try:
-        # Convert ROS image to OpenCV BGR image (standard for cv2)
         cv_img = bridge.imgmsg_to_cv2(img, desired_encoding="bgr8")
     except cv_bridge.CvBridgeError as e:
         rospy.logerr("CvBridge Error: %s" % str(e))
@@ -195,7 +229,6 @@ def encode_image(img):
         rospy.logerr("Failed to encode image to JPEG")
         return None
 
-    # Handle buffer.tobytes() for newer OpenCV vs buffer.tostring() for older OpenCV versions
     if hasattr(buffer, 'tobytes'):
         raw_bytes = buffer.tobytes()
     else:
@@ -208,8 +241,6 @@ def prompt_model(text, image):
 
     if image is not None:
         base64_image = base64.b64encode(image)
-
-        # Ensure it's returned as a unicode string on both Python 2 and 3
         if isinstance(base64_image, bytes):
             base64_image = base64_image.decode("utf-8")
 
@@ -220,7 +251,6 @@ def prompt_model(text, image):
             }
         })
 
-    # Construct the JSON payload exactly as the OpenAI API expects
     payload = {
         "model": "mlx-community/Qwen3-VL-4B-Instruct-4bit",
         "messages": [
@@ -235,31 +265,23 @@ def prompt_model(text, image):
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer EMPTY"  # Required by some local servers even if auth is off
+        "Authorization": "Bearer EMPTY"
     }
 
-    # Encode JSON payload to bytes for HTTP request payload compatibility
     json_data = json.dumps(payload).encode("utf-8")
-
-    # Create the HTTP request
     request = urllib_req.Request(VLM_API_URL, data=json_data, headers=headers)
 
     try:
-        # Send the request and read the response
         response = urllib_req.urlopen(request)
         response_data = response.read()
 
         if isinstance(response_data, bytes):
             response_data = response_data.decode("utf-8")
 
-        # Parse the JSON string back into a Python dictionary
         result = json.loads(response_data)
-
-        # Extract the content from the response tree
         return result["choices"][0]["message"]["content"]
 
     except Exception as e:
-        # Catch the exception and print the actual error message to the ROS console
         rospy.logerr("Failed to query model: %s" % str(e))
         return ""
 
@@ -285,7 +307,6 @@ def parse_instructions_prompt(prompt):
             rospy.loginfo("Command was parsed, but it is not a navigation task.")
 
     except ValueError as e:
-        # This catches JSON parsing errors if the LLM hallucinates bad formatting
         rospy.logerr("Failed to parse JSON from LLM. Raw output was: %s", reply)
 
     return None
@@ -294,10 +315,8 @@ def detect_targets_in_image(instructions, image):
     reply = prompt_model(prompt_object_detection.format(instructions["target"], instructions["desc"]), image)
     try:
         items = []
-        image_width, image_height = VLM_IMAGE_SIZE
         for item in json.loads(reply.strip()):
             box = item["box"]
-
             items.append({
                 "desc": item["desc"],
                 "box":  box,
@@ -305,7 +324,6 @@ def detect_targets_in_image(instructions, image):
         return items
 
     except ValueError as e:
-        # This catches JSON parsing errors if the LLM hallucinates bad formatting
         rospy.logerr("Failed to parse JSON from LLM. Raw output was: %s", reply)
         return None
 
@@ -323,7 +341,6 @@ def get_depth_data(image):
     raw_bytes = zlib.decompress(compressed_data)
 
     depth_map = np.fromstring(raw_bytes, dtype=np.float32).reshape((h, w))
-
     return depth_map
 
 if __name__ == '__main__':
