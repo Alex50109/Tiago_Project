@@ -22,7 +22,8 @@ from std_srvs.srv import Empty
 
 HEAD_TILT = -0.1
 HEAD_PAN_LIMIT = math.radians(70.0)
-HEAD_PAN_STEP = math.radians(2.0)
+HEAD_TILT_LIMITS = (math.radians(-56.0), math.radians(41.0))
+HEAD_AIM_STEP = math.radians(2.0)
 STANDOFF_DIST = 0.5
 
 class OdomTracker:
@@ -132,7 +133,7 @@ class Controller:
         """
         if image_id not in self.snapshot_memory:
             rospy.logerr("Memory error! I have no data for image {}.".format(image_id))
-            return None, None
+            return None, None, None
 
         snapshot = self.snapshot_memory[image_id]
         trans = snapshot['trans']
@@ -159,7 +160,7 @@ class Controller:
         point_camera = np.array([X_camera, Y_camera, Z_camera, 1.0])
         point_map = np.dot(matrix, point_camera)
 
-        return point_map[0], point_map[1]
+        return point_map[0], point_map[1], point_map[2]
 
     def rotate_to_yaw(self, target_yaw):
         """
@@ -197,22 +198,41 @@ class Controller:
         traj.points.append(point)
         self.head_pub.publish(traj)
 
-    def aim_head_at_map_point(self, target_x, target_y, current_pan):
+    def aim_head_at_map_point(self, target_point, current_pan, current_tilt):
         """
-        Points the head pan at a map coordinate, clamped to the head joint range.
-        Returns the pan actually applied so changes can be throttled across calls.
+        Keeps the head pointed at the target's 3D map position while the robot moves.
+        The angles are computed from the vector between the head's tilt-axis pivot and
+        the target, so the tilt ramps down as the robot approaches the object.
+        Returns the applied pan and tilt so changes can be throttled across calls.
         """
+        try:
+            (pivot_trans, _) = self.tf_listener.lookupTransform('/map', '/head_2_link', rospy.Time(0))
+        except tf.Exception:
+            return current_pan, current_tilt
+
         robot_x, robot_y, robot_yaw = self.get_robot_pose()
         if robot_x is None:
-            return current_pan
+            return current_pan, current_tilt
 
-        bearing = math.atan2(target_y - robot_y, target_x - robot_x)
-        pan = max(min(normalize_angle(bearing - robot_yaw), HEAD_PAN_LIMIT), -HEAD_PAN_LIMIT)
+        dx = target_point[0] - pivot_trans[0]
+        dy = target_point[1] - pivot_trans[1]
+        dz = target_point[2] - pivot_trans[2]
 
-        if abs(normalize_angle(pan - current_pan)) >= HEAD_PAN_STEP:
-            self.set_head_pose(pan, HEAD_TILT)
-            return pan
-        return current_pan
+        cos_yaw = math.cos(-robot_yaw)
+        sin_yaw = math.sin(-robot_yaw)
+        base_dx = cos_yaw * dx - sin_yaw * dy
+        base_dy = sin_yaw * dx + cos_yaw * dy
+        base_dz = dz
+
+        pan = max(min(math.atan2(base_dy, base_dx), HEAD_PAN_LIMIT), -HEAD_PAN_LIMIT)
+        tilt = max(min(math.atan2(base_dz, math.hypot(base_dx, base_dy)),
+                       HEAD_TILT_LIMITS[1]), HEAD_TILT_LIMITS[0])
+
+        if abs(normalize_angle(pan - current_pan)) >= HEAD_AIM_STEP or \
+                abs(normalize_angle(tilt - current_tilt)) >= HEAD_AIM_STEP:
+            self.set_head_pose(pan, tilt)
+            return pan, tilt
+        return current_pan, current_tilt
 
     def get_robot_pose(self):
         """Gets the current X, Y position and yaw of the robot in the map frame."""
@@ -394,6 +414,7 @@ class Controller:
         goal_point = (nav_goal.target_pose.pose.position.x, nav_goal.target_pose.pose.position.y)
 
         head_pan = 0.0
+        head_tilt = HEAD_TILT
         last_capture_time = rospy.Time(0)
         rate = rospy.Rate(5)
 
@@ -429,7 +450,7 @@ class Controller:
                 else:
                     rospy.logwarn("Target update referenced unknown image {}.".format(update.image_id))
 
-            head_pan = self.aim_head_at_map_point(target_point[0], target_point[1], head_pan)
+            head_pan, head_tilt = self.aim_head_at_map_point(target_point, head_pan, head_tilt)
 
             now = rospy.Time.now()
             if (now - last_capture_time).to_sec() >= self.capture_period:
@@ -492,7 +513,7 @@ class Controller:
                     result = ControllerFindObjectResult()
                     result.target_found = True
                     result.reached = False
-                    result.final_position = Point(target_point[0], target_point[1], 0.0)
+                    result.final_position = Point(target_point[0], target_point[1], target_point[2])
                     self.find_server.set_aborted(result)
                     return
                 reached_final = reached
@@ -505,7 +526,7 @@ class Controller:
             result.target_found = target_point is not None
             result.reached = reached_final
             if target_point is not None:
-                result.final_position = Point(target_point[0], target_point[1], 0.0)
+                result.final_position = Point(target_point[0], target_point[1], target_point[2])
             self.find_server.set_succeeded(result)
 
         except rospy.ROSInterruptException:
