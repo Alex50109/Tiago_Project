@@ -11,50 +11,49 @@ import urllib2 as urllib_req
 import zlib
 import numpy as np
 
-from tiago_project.msg import ControllerSpinAction, ControllerSpinGoal
-from tiago_project.msg import ControllerNavigateAction, ControllerNavigateGoal
+from tiago_project.msg import ControllerFindObjectAction, ControllerFindObjectGoal
+from tiago_project.msg import TargetUpdate
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
-from tiago_project.algorithms import ransac_linear_regression
 
 SERVER_IP = "10.41.3.112"
 
 VLM_API_URL = "http://{}:8000/v1/chat/completions".format(SERVER_IP)
 
-# Port 9090 for the Non-Metric Model, Port 9000 for the OLD Metric Model
-DEPTH_SERVER_URL = "http://{}:9090/predict_depth_raw".format(SERVER_IP)
+# Port 9000 for the Metric Depth Model
 METRIC_DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
 
 SPIN_STEP_ANGLE = 45.0
 SPIN_STEPS = 8
-QUEUE_SIZE = 8
 VLM_IMAGE_SIZE = (640.0, 480.0)
+
+TERMINAL_GOAL_STATES = [
+    actionlib.GoalStatus.SUCCEEDED,
+    actionlib.GoalStatus.ABORTED,
+    actionlib.GoalStatus.PREEMPTED,
+    actionlib.GoalStatus.REJECTED,
+    actionlib.GoalStatus.LOST,
+]
 
 class Pilot:
     def __init__(self):
-        self.spin_client = actionlib.SimpleActionClient('spin', ControllerSpinAction)
-        self.navigate_client = actionlib.SimpleActionClient('navigate', ControllerNavigateAction)
+        self.find_client = actionlib.SimpleActionClient('find_object', ControllerFindObjectAction)
+        self.update_pub = rospy.Publisher('/target_update', TargetUpdate, queue_size=1)
 
         rospy.loginfo("Pilot waking up... Waiting for controller to come online.")
 
-        self.spin_client.wait_for_server()
-        self.navigate_client.wait_for_server()
+        self.find_client.wait_for_server()
 
         rospy.loginfo("Controller linked. Ready to command!")
 
-        self.task_prompt = None
-        self.done_spinning = False
-        self.targets = []
-
-        self.spin_image_queue = queue.Queue(SPIN_STEPS)
+        self.image_queue = queue.Queue(SPIN_STEPS)
 
     def clear_image_queue(self):
         # clear queue (maybe there is a better way)
         while True:
             try:
-                self.spin_image_queue.get_nowait()
+                self.image_queue.get_nowait()
             except queue.Empty:
                 break
-
 
     def execute_task(self, instructions):
         target = parse_instructions_prompt(instructions)
@@ -65,176 +64,66 @@ class Pilot:
         rospy.loginfo("Command is to go to %s (keep %s in mind)!", target["target"], target["desc"])
 
         self.clear_image_queue()
-        # start spinning
-        self.spin_client.send_goal(ControllerSpinGoal(num_pictures=SPIN_STEPS, step_angle=SPIN_STEP_ANGLE), feedback_cb=self.spin_feedback_callback)
+        self.find_client.send_goal(
+            ControllerFindObjectGoal(num_pictures=SPIN_STEPS, step_angle=SPIN_STEP_ANGLE, navigate=True),
+            feedback_cb=self.feedback_callback
+        )
 
-        images_processed = 0
-        found_target = None
-        found_image_id = None
-        found_encoded_image = None
-        found_depth_data = None
+        update_sent = False
 
-        while images_processed < SPIN_STEPS and not rospy.is_shutdown():
+        while not rospy.is_shutdown():
+            if self.find_client.get_state() in TERMINAL_GOAL_STATES:
+                break
+
             try:
-                image_id, image_data, depth_data = self.spin_image_queue.get(timeout=1.0)
-                images_processed += 1
-
-                encoded_image = encode_image(image_data)
-
-                rospy.loginfo("Prompting picture %d!", image_id + 1)
-                result = detect_targets_in_image(target, encoded_image)
-                rospy.loginfo("LLM returned: %s", result)
-
-                if result is not None and len(result) > 0:
-                    found_image_id = image_id
-                    found_target = result[0]
-                    found_encoded_image = encoded_image
-                    found_depth_data = depth_data
-
-                    rospy.loginfo("Target found! Canceling remaining spin.")
-
-                    current_state = self.spin_client.get_state()
-                    if current_state in [actionlib.GoalStatus.PENDING, actionlib.GoalStatus.ACTIVE]:
-                        rospy.loginfo("Canceling the remaining spin.")
-                        self.spin_client.cancel_goal()
-                    else:
-                        rospy.loginfo("Spin was already finished. No need to cancel.")
-
-                    found_encoded_image = encoded_image
-
-                    break
-
+                image_id, image_data, depth_data = self.image_queue.get(timeout=1.0)
             except queue.Empty:
-                state = self.spin_client.get_state()
-                if state in [actionlib.GoalStatus.SUCCEEDED, actionlib.GoalStatus.ABORTED, actionlib.GoalStatus.PREEMPTED]:
-                    rospy.logwarn("Spin action ended early. Stopping image processing.")
-                    break
                 continue
 
-        if found_target is None:
-            rospy.logerr("Target not found!")
-            return False
+            encoded_image = encode_image(image_data)
+            if encoded_image is None:
+                continue
 
-        # Extract normalized bounding box coordinates
-        x_min, y_min, x_max, y_max = found_target["box"]
-        u_min = min(max(x_min / 1000.0, 0.0), 1.0)
-        v_min = min(max(y_min / 1000.0, 0.0), 1.0)
-        u_max = min(max(x_max / 1000.0, 0.0), 1.0)
-        v_max = min(max(y_max / 1000.0, 0.0), 1.0)
+            rospy.loginfo("Prompting picture %d!", image_id + 1)
+            detections = detect_targets_in_image(target, encoded_image)
+            rospy.loginfo("LLM returned: %s", detections)
 
-        center_u = (u_min + u_max) / 2.0
-        center_v = (v_min + v_max) / 2.0
+            if not detections:
+                continue
 
-        rospy.loginfo("Object center is at coords: u={:.3f}, v={:.3f}".format(center_u, center_v))
+            depth = compute_object_depth(depth_data, encoded_image, detections[0]["box"])
+            if depth is None:
+                rospy.logwarn("Depth estimation failed for picture %d. Trying the next frame.", image_id + 1)
+                continue
 
-        # Convert Hardware Depth to Numpy Array
-        try:
-            hw_depth_raw = bridge.imgmsg_to_cv2(found_depth_data, desired_encoding="passthrough")
-        except cv_bridge.CvBridgeError as e:
-            rospy.logerr("CvBridge Error: %s" % str(e))
-            return False
+            center_u, center_v = detection_center(detections[0]["box"])
 
-        # Convert 16UC1 (millimeters) to meters if necessary
-        if hw_depth_raw.dtype == np.uint16:
-            hw_depth = hw_depth_raw.astype(np.float32) / 1000.0
-        else:
-            hw_depth = hw_depth_raw.copy()
+            update = TargetUpdate()
+            update.header.stamp = rospy.Time.now()
+            update.image_id = image_id
+            update.target_u = center_u
+            update.target_v = center_v
+            update.depth = depth
+            self.update_pub.publish(update)
 
-        hw_h, hw_w = hw_depth.shape
+            if not update_sent:
+                rospy.loginfo("Target found at {:.2f}m! Steering the navigation with live updates.".format(depth))
+                update_sent = True
+                self.clear_image_queue()
 
-        # Extract Center 50% ROI of the bounding box (ROI = region of interest)
-        roi_u_min = u_min + (u_max - u_min) * 0.25
-        roi_u_max = u_max - (u_max - u_min) * 0.25
-        roi_v_min = v_min + (v_max - v_min) * 0.25
-        roi_v_max = v_max - (v_max - v_min) * 0.25
+        result = self.find_client.get_result()
+        if result is not None:
+            rospy.loginfo("Mission over! target_found=%s reached=%s", result.target_found, result.reached)
+            return result.reached
 
-        px_min = max(0, int(roi_u_min * (hw_w - 1)))
-        px_max = min(hw_w, max(px_min + 1, int(roi_u_max * (hw_w - 1))))
-        py_min = max(0, int(roi_v_min * (hw_h - 1)))
-        py_max = min(hw_h, max(py_min + 1, int(roi_v_max * (hw_h - 1))))
+        return update_sent
 
-        # -------------------------------------------------------------
-        # DEBUG IMAGE GENERATION: Draw Bounding Box and ROI
-        # -------------------------------------------------------------
-        try:
-            # 1. Decode the saved PNG bytes back to a numpy BGR image
-            debug_rgb = cv2.imdecode(np.fromstring(found_encoded_image, np.uint8), cv2.IMREAD_COLOR)
-
-            # 2. Normalize and colorize the raw hardware depth map for human viewing
-            # Clip depth to 5 meters for better contrast, then scale to 0-255
-            depth_clipped = np.clip(hw_depth, 0, 5.0)
-            depth_normalized = ((depth_clipped / 5.0) * 255.0).astype(np.uint8)
-            debug_depth_color = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
-
-            # Calculate the full bounding box pixel coordinates
-            bb_x_min = int(u_min * hw_w)
-            bb_x_max = int(u_max * hw_w)
-            bb_y_min = int(v_min * hw_h)
-            bb_y_max = int(v_max * hw_h)
-
-            # Draw the Full Bounding Box (Red, thick line)
-            cv2.rectangle(debug_rgb, (bb_x_min, bb_y_min), (bb_x_max, bb_y_max), (0, 0, 255), 2)
-            cv2.rectangle(debug_depth_color, (bb_x_min, bb_y_min), (bb_x_max, bb_y_max), (0, 0, 255), 2)
-
-            # Draw the Center 50% ROI Box (Green, thick line)
-            cv2.rectangle(debug_rgb, (px_min, py_min), (px_max, py_max), (0, 255, 0), 2)
-            cv2.rectangle(debug_depth_color, (px_min, py_min), (px_max, py_max), (0, 255, 0), 2)
-
-            # Save the images to disk
-            cv2.imwrite("/tmp/debug_tiago_rgb.jpg", debug_rgb)
-            cv2.imwrite("/tmp/debug_tiago_depth.jpg", debug_depth_color)
-            rospy.loginfo("Saved debug images to /tmp/debug_tiago_rgb.jpg and /tmp/debug_tiago_depth.jpg")
-
-        except Exception as e:
-            rospy.logerr("Failed to generate debug images: %s", str(e))
-        # -------------------------------------------------------------
-
-        hw_roi_patch = hw_depth[py_min:py_max, px_min:px_max]
-
-        # Clean NumPy approach: Get only valid hardware pixels FIRST to prevent any warnings
-        roi_finite_mask = np.isfinite(hw_roi_patch)
-        roi_finite_pixels = hw_roi_patch[roi_finite_mask]
-
-        # Filter by distance on strictly valid numbers
-        valid_hw_pixels = roi_finite_pixels[(roi_finite_pixels > 0.2) & (roi_finite_pixels < 3.0)]
-
-        depth = 0.0
-
-        # Require at least 30% of the patch size to trust hardware
-        if len(valid_hw_pixels) > (hw_roi_patch.size * 0.30):
-            depth = float(np.median(valid_hw_pixels))
-            rospy.loginfo("Hardware depth acquired successfully. Object is close.")
-        else:
-            rospy.loginfo("Hardware depth blind in bounding box. Using AI model...")
-            try:
-                rospy.loginfo("Fetching metric depth model data...")
-                metric_depth_map = get_depth_data(found_encoded_image, url=METRIC_DEPTH_SERVER_URL)
-                metric_depth_resized = cv2.resize(metric_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
-
-                metric_roi_patch = metric_depth_resized[py_min:py_max, px_min:px_max]
-                depth = float(np.median(metric_roi_patch))
-
-            except Exception as e:
-                rospy.logerr("Failed to fetch from metric depth server: %s", str(e))
-
-        rospy.loginfo("Final calculated depth: {:.2f} meters".format(depth))
-
-        # Wait for spinning to finish
-        self.spin_client.wait_for_result()
-        rospy.sleep(0.5)
-
-        self.navigate_client.send_goal_and_wait(ControllerNavigateGoal(
-            target_u=center_u,
-            target_v=center_v,
-            depth=depth,
-            image_id=found_image_id
-        ))
-
-        return True
-
-    def spin_feedback_callback(self, feedback):
+    def feedback_callback(self, feedback):
         rospy.loginfo("Pilot received picture %d!", feedback.image_id + 1)
-        self.spin_image_queue.put((feedback.image_id, feedback.image_data, feedback.depth_data))
+        if feedback.navigating:
+            # only the freshest frame matters while driving
+            self.clear_image_queue()
+        self.image_queue.put((feedback.image_id, feedback.image_data, feedback.depth_data))
 
 bridge = cv_bridge.CvBridge()
 
@@ -359,7 +248,123 @@ def detect_targets_in_image(instructions, image):
         rospy.logerr("Failed to parse JSON from LLM. Raw output was: %s", reply)
         return None
 
-def get_depth_data(image, url=DEPTH_SERVER_URL):
+def normalize_box(box):
+    """Clips a VLM bounding box from the 0-1000 scale to normalized [0, 1] coordinates."""
+    x_min, y_min, x_max, y_max = box
+    u_min = min(max(x_min / 1000.0, 0.0), 1.0)
+    v_min = min(max(y_min / 1000.0, 0.0), 1.0)
+    u_max = min(max(x_max / 1000.0, 0.0), 1.0)
+    v_max = min(max(y_max / 1000.0, 0.0), 1.0)
+    return u_min, v_min, u_max, v_max
+
+def detection_center(box):
+    """Normalized (u, v) center of a VLM bounding box."""
+    u_min, v_min, u_max, v_max = normalize_box(box)
+    return (u_min + u_max) / 2.0, (v_min + v_max) / 2.0
+
+def compute_object_depth(depth_data, encoded_image, box):
+    """
+    Median depth of the object's central bounding box ROI, measured with the
+    hardware depth camera or, when the hardware is blind, with the metric AI model.
+    Returns None when no trustworthy depth can be produced.
+    """
+    try:
+        hw_depth_raw = bridge.imgmsg_to_cv2(depth_data, desired_encoding="passthrough")
+    except cv_bridge.CvBridgeError as e:
+        rospy.logerr("CvBridge Error: %s" % str(e))
+        return None
+
+    # Convert 16UC1 (millimeters) to meters if necessary
+    if hw_depth_raw.dtype == np.uint16:
+        hw_depth = hw_depth_raw.astype(np.float32) / 1000.0
+    else:
+        hw_depth = hw_depth_raw.copy()
+
+    hw_h, hw_w = hw_depth.shape
+
+    u_min, v_min, u_max, v_max = normalize_box(box)
+
+    # Extract Center 50% ROI of the bounding box (ROI = region of interest)
+    roi_u_min = u_min + (u_max - u_min) * 0.25
+    roi_u_max = u_max - (u_max - u_min) * 0.25
+    roi_v_min = v_min + (v_max - v_min) * 0.25
+    roi_v_max = v_max - (v_max - v_min) * 0.25
+
+    px_min = max(0, int(roi_u_min * (hw_w - 1)))
+    px_max = min(hw_w, max(px_min + 1, int(roi_u_max * (hw_w - 1))))
+    py_min = max(0, int(roi_v_min * (hw_h - 1)))
+    py_max = min(hw_h, max(py_min + 1, int(roi_v_max * (hw_h - 1))))
+
+    # -------------------------------------------------------------
+    # DEBUG IMAGE GENERATION: Draw Bounding Box and ROI
+    # -------------------------------------------------------------
+    try:
+        # 1. Decode the saved PNG bytes back to a numpy BGR image
+        debug_rgb = cv2.imdecode(np.fromstring(encoded_image, np.uint8), cv2.IMREAD_COLOR)
+
+        # 2. Normalize and colorize the raw hardware depth map for human viewing
+        # Clip depth to 5 meters for better contrast, then scale to 0-255
+        depth_clipped = np.clip(hw_depth, 0, 5.0)
+        depth_normalized = ((depth_clipped / 5.0) * 255.0).astype(np.uint8)
+        debug_depth_color = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+
+        # Calculate the full bounding box pixel coordinates
+        bb_x_min = int(u_min * hw_w)
+        bb_x_max = int(u_max * hw_w)
+        bb_y_min = int(v_min * hw_h)
+        bb_y_max = int(v_max * hw_h)
+
+        # Draw the Full Bounding Box (Red, thick line)
+        cv2.rectangle(debug_rgb, (bb_x_min, bb_y_min), (bb_x_max, bb_y_max), (0, 0, 255), 2)
+        cv2.rectangle(debug_depth_color, (bb_x_min, bb_y_min), (bb_x_max, bb_y_max), (0, 0, 255), 2)
+
+        # Draw the Center 50% ROI Box (Green, thick line)
+        cv2.rectangle(debug_rgb, (px_min, py_min), (px_max, py_max), (0, 255, 0), 2)
+        cv2.rectangle(debug_depth_color, (px_min, py_min), (px_max, py_max), (0, 255, 0), 2)
+
+        # Save the images to disk
+        cv2.imwrite("/tmp/debug_tiago_rgb.jpg", debug_rgb)
+        cv2.imwrite("/tmp/debug_tiago_depth.jpg", debug_depth_color)
+        rospy.loginfo("Saved debug images to /tmp/debug_tiago_rgb.jpg and /tmp/debug_tiago_depth.jpg")
+
+    except Exception as e:
+        rospy.logerr("Failed to generate debug images: %s", str(e))
+    # -------------------------------------------------------------
+
+    hw_roi_patch = hw_depth[py_min:py_max, px_min:px_max]
+
+    # Clean NumPy approach: Get only valid hardware pixels FIRST to prevent any warnings
+    roi_finite_mask = np.isfinite(hw_roi_patch)
+    roi_finite_pixels = hw_roi_patch[roi_finite_mask]
+
+    # Filter by distance on strictly valid numbers
+    valid_hw_pixels = roi_finite_pixels[(roi_finite_pixels > 0.2) & (roi_finite_pixels < 3.0)]
+
+    depth = None
+
+    # Require at least 30% of the patch size to trust hardware
+    if len(valid_hw_pixels) > (hw_roi_patch.size * 0.30):
+        depth = float(np.median(valid_hw_pixels))
+        rospy.loginfo("Hardware depth acquired successfully. Object is close.")
+    else:
+        rospy.loginfo("Hardware depth blind in bounding box. Using AI model...")
+        try:
+            rospy.loginfo("Fetching metric depth model data...")
+            metric_depth_map = get_depth_data(encoded_image, url=METRIC_DEPTH_SERVER_URL)
+            metric_depth_resized = cv2.resize(metric_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
+
+            metric_roi_patch = metric_depth_resized[py_min:py_max, px_min:px_max]
+            depth = float(np.median(metric_roi_patch))
+
+        except Exception as e:
+            rospy.logerr("Failed to fetch from metric depth server: %s", str(e))
+
+    if depth is not None:
+        rospy.loginfo("Final calculated depth: {:.2f} meters".format(depth))
+
+    return depth
+
+def get_depth_data(image, url=METRIC_DEPTH_SERVER_URL):
     req = urllib_req.Request(url, data=image)
     req.add_header('Content-Type', 'application/octet-stream')
     req.add_header('Content-Length', str(len(image)))

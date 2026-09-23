@@ -1,10 +1,15 @@
 # GOAL
 int32 num_pictures
 float32 step_angle
+bool navigate
 ---
 # RESULT
+bool target_found
+bool reached
+geometry_msgs/Point final_position
 ---
 # FEEDBACK
 int32 image_id
 sensor_msgs/Image image_data
 sensor_msgs/Image depth_data
+bool navigating
