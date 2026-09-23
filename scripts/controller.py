@@ -70,7 +70,7 @@ class Controller:
 
         self.clear_costmaps_srv = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
 
-        self.camera_topic = '/xtion/rgb/image_rect_color'
+        self.camera_topic = '/xtion/rgb/image_raw'
         self.depth_topic = '/xtion/depth_registered/image_raw'
         self.camera_info_topic = '/xtion/rgb/camera_info'
 
@@ -97,6 +97,68 @@ class Controller:
 
         rospy.loginfo("Ready?! Vodafone!")
 
+    def get_target_map_point(self, image_id, u, v, depth=1.0):
+        """
+        Deprojects a 2D pixel from a past snapshot into a 3D Map coordinate.
+        If depth is omitted, it defaults to 1.0 (useful for ray-casting / yaw alignment).
+        """
+        if image_id not in self.snapshot_memory:
+            rospy.logerr("Memory error! I have no data for image {}.".format(image_id))
+            return None, None
+
+        snapshot = self.snapshot_memory[image_id]
+        trans = snapshot['trans']
+        rot = snapshot['rot']
+
+        fx = self.camera_info["fx"]
+        fy = self.camera_info["fy"]
+        cx = self.camera_info["cx"]
+        cy = self.camera_info["cy"]
+        img_w = self.camera_info["width"]
+        img_h = self.camera_info["height"]
+
+        pixel_u = u * img_w
+        pixel_v = v * img_h
+
+        X_camera = (pixel_u - cx) * depth / fx
+        Y_camera = (pixel_v - cy) * depth / fy
+        Z_camera = depth
+
+        # Apply the transform
+        matrix = tft.quaternion_matrix(rot)
+        matrix[0:3, 3] = trans
+
+        point_camera = np.array([X_camera, Y_camera, Z_camera, 1.0])
+        point_map = np.dot(matrix, point_camera)
+
+        return point_map[0], point_map[1]
+
+    def rotate_to_yaw(self, target_yaw, action_server):
+        """
+        Rotates the robot base to a specific yaw angle using proportional control.
+        """
+        rate = rospy.Rate(100)
+        vel_msg = Twist()
+        max_angular_speed = 1.0
+
+        while not (rospy.is_shutdown() or action_server.is_preempt_requested()):
+            error = normalize_angle(target_yaw - self.odom_tracker.current_yaw)
+
+            if abs(error) < 0.02:
+                break
+
+            p_speed = 0.8 * error
+
+            if p_speed > 0:
+                vel_msg.angular.z = min(max(p_speed, 0.1), max_angular_speed)
+            else:
+                vel_msg.angular.z = max(min(p_speed, -0.1), -max_angular_speed)
+
+            self.cmd_pub.publish(vel_msg)
+            rate.sleep()
+
+        self.cmd_pub.publish(Twist())  # Stop moving once done
+
     def spin_callback(self, goal):
         with self.state_lock:
             if self.busy:
@@ -110,7 +172,7 @@ class Controller:
         traj = JointTrajectory()
         traj.joint_names = ['head_1_joint', 'head_2_joint']
         point = JointTrajectoryPoint()
-        point.positions = [0.0, -0.1] # Look forward, tilt down
+        point.positions = [0.0, -0.1]  # Look forward, tilt down
         point.time_from_start = rospy.Duration(0.2)
         traj.points.append(point)
         self.head_pub.publish(traj)
@@ -118,14 +180,34 @@ class Controller:
         try:
             rospy.loginfo("Starting work: Take {} pictures every {}.".format(goal.num_pictures, goal.step_angle))
 
-            step_angle_rad = math.radians(goal.step_angle)
-            max_angular_speed = 1.0
-            rotation_time = step_angle_rad / max_angular_speed
-            initial_yaw = self.odom_tracker.current_yaw
-            rate = rospy.Rate(100)
+            # --- PRE-ROTATION LOGIC ---
+            if getattr(goal, 'rotate_first', False):
+                rospy.loginfo("Pre-aligning to pixel ({}, {}) from image {}".format(
+                    goal.target_u, goal.target_v, goal.image_id))
 
+                # Use depth=1.0 to cast a ray and calculate the yaw angle
+                target_x, target_y = self.get_target_map_point(goal.image_id, goal.target_u, goal.target_v, depth=1.0)
+
+                if target_x is not None and target_y is not None:
+                    robot_x, robot_y = self.get_robot_pose()
+                    if robot_x is not None:
+                        # Angle pointing from current robot base to the projected point
+                        target_yaw = math.atan2(target_y - robot_y, target_x - robot_x)
+                        self.rotate_to_yaw(target_yaw, self.spin_server)
+
+                        if self.spin_server.is_preempt_requested():
+                            self.spin_server.set_preempted()
+                            rospy.loginfo("Spin preempted during pre-rotation!")
+                            return
+                else:
+                    rospy.logwarn("Failed to get target map point for pre-rotation.")
+
+            # Set the initial yaw for the spin sequence (either current yaw or newly aligned yaw)
+            step_angle_rad = math.radians(goal.step_angle)
+            initial_yaw = self.odom_tracker.current_yaw
             feedback = ControllerSpinFeedback()
 
+            # --- PICTURE LOOP ---
             for i in range(goal.num_pictures):
                 if self.spin_server.is_preempt_requested():
                     self.spin_server.set_preempted()
@@ -143,7 +225,7 @@ class Controller:
                 error_deg = math.degrees(error_rad)
 
                 rospy.loginfo("Picture {} | Target: {:.2f} deg | Actual: {:.2f} deg | Error: {:.2f} deg".format(
-                    i+1, i_angle_deg, c_angle_deg, error_deg
+                    i + 1, i_angle_deg, c_angle_deg, error_deg
                 ))
 
                 try:
@@ -161,8 +243,6 @@ class Controller:
                         'rot': rot
                     }
 
-                    # TODO: maybe implement persistent image ids, so that past
-                    # images from previous scans are also available
                     feedback.image_id = i
                     feedback.image_data = image
                     feedback.depth_data = depth_image
@@ -175,29 +255,11 @@ class Controller:
                 except tf.Exception as e:
                     rospy.logwarn("TF Error while taking picture: {}".format(e))
 
-                target_yaw = normalize_angle(initial_yaw + ((i + 1) * step_angle_rad))
-                vel_msg = Twist()
-
-                while not (rospy.is_shutdown() or self.spin_server.is_preempt_requested()):
-                    error = normalize_angle(target_yaw - self.odom_tracker.current_yaw)
-
-                    if abs(error) < 0.02:
-                        break
-
-                    p_speed = 0.8 * error
-
-                    if p_speed > 0:
-                        vel_msg.angular.z = min(max(p_speed, 0.1), max_angular_speed)
-                    else:
-                        vel_msg.angular.z = max(min(p_speed, -0.1), -max_angular_speed)
-
-                    self.cmd_pub.publish(vel_msg)
-                    rate.sleep()
-
-                self.cmd_pub.publish(Twist())
+                if i < goal.num_pictures - 1:
+                    next_yaw = normalize_angle(initial_yaw + ((i + 1) * step_angle_rad))
+                    self.rotate_to_yaw(next_yaw, self.spin_server)
 
             rospy.loginfo("Work is done here! Spinned enough! Me no busy!")
-
             self.spin_server.set_succeeded()
 
         finally:
@@ -216,41 +278,13 @@ class Controller:
             rospy.loginfo("Deprojecting pixel ({}, {}) from image {}...".format(
                 goal.target_u, goal.target_v, goal.image_id))
 
-            if goal.image_id not in self.snapshot_memory:
-                rospy.logerr("Memory error! I have no data for image {}.".format(goal.image_id))
+            # --- USE REFACTORED HELPER ---
+            target_x, target_y = self.get_target_map_point(
+                goal.image_id, goal.target_u, goal.target_v, depth=goal.depth)
+
+            if target_x is None or target_y is None:
                 self.navigate_server.set_aborted()
                 return
-
-            snapshot = self.snapshot_memory[goal.image_id]
-            trans = snapshot['trans']
-            rot = snapshot['rot']
-
-            fx = self.camera_info["fx"]
-            fy = self.camera_info["fy"]
-            cx = self.camera_info["cx"]
-            cy = self.camera_info["cy"]
-            img_w = self.camera_info["width"]
-            img_h = self.camera_info["height"]
-
-            pixel_u = goal.target_u * img_w
-            pixel_v = goal.target_v * img_h
-
-            Z = goal.depth
-            X_camera = (pixel_u - cx) * Z / fx
-            Y_camera = (pixel_v - cy) * Z / fy
-            Z_camera = Z
-
-            # Apply the transform
-            matrix = tft.quaternion_matrix(rot)
-            matrix[0:3, 3] = trans
-
-            point_camera = np.array([X_camera, Y_camera, Z_camera, 1.0])
-            point_map = np.dot(matrix, point_camera)
-
-            target_x = point_map[0]
-            target_y = point_map[1]
-
-            # ---------------------------------------------------------
 
             rospy.loginfo("Starting work: Sailing to [{:.2f}, {:.2f}].".format(target_x, target_y))
 
@@ -262,48 +296,47 @@ class Controller:
             dx = target_x - robot_x
             dy = target_y - robot_y
             distance_to_target = math.hypot(dx, dy)
-            yaw_angle = math.atan2(dy, dx) # Angle pointing from robot to object
+            yaw_angle = math.atan2(dy, dx)  # Angle pointing from robot to object
 
-            STANDOFF_DIST = 0
+            STANDOFF_DIST = 0.5
 
             if distance_to_target <= STANDOFF_DIST:
                 rospy.loginfo("Robot is already within {}m of the target.".format(STANDOFF_DIST))
+                self.navigate_server.set_succeeded()
                 return
 
             # Calculate coordinate exactly 0.5m short of the object
             goal_x = target_x - (STANDOFF_DIST * math.cos(yaw_angle))
             goal_y = target_y - (STANDOFF_DIST * math.sin(yaw_angle))
 
-            rospy.loginfo("Object at ({}, {}). Driving to safe standoff at ({:.2f}, {:.2f})...".format(
+            rospy.loginfo("Object at ({:.2f}, {:.2f}). Driving to safe standoff at ({:.2f}, {:.2f})...".format(
                 target_x, target_y, goal_x, goal_y))
 
             # Send the Goal
-            goal = MoveBaseGoal()
-            goal.target_pose.header.frame_id = "map"
-            goal.target_pose.header.stamp = rospy.Time.now()
-            goal.target_pose.pose.position.x = goal_x
-            goal.target_pose.pose.position.y = goal_y
+            nav_goal = MoveBaseGoal()
+            nav_goal.target_pose.header.frame_id = "map"
+            nav_goal.target_pose.header.stamp = rospy.Time.now()
+            nav_goal.target_pose.pose.position.x = goal_x
+            nav_goal.target_pose.pose.position.y = goal_y
 
             # Convert yaw angle so the robot is facing the object when it stops
             q = tft.quaternion_from_euler(0, 0, yaw_angle)
-            goal.target_pose.pose.orientation.x = q[0]
-            goal.target_pose.pose.orientation.y = q[1]
-            goal.target_pose.pose.orientation.z = q[2]
-            goal.target_pose.pose.orientation.w = q[3]
+            nav_goal.target_pose.pose.orientation.x = q[0]
+            nav_goal.target_pose.pose.orientation.y = q[1]
+            nav_goal.target_pose.pose.orientation.z = q[2]
+            nav_goal.target_pose.pose.orientation.w = q[3]
 
-            self.nav_client.send_goal(goal)
+            self.nav_client.send_goal(nav_goal)
 
             rate = rospy.Rate(5)
-            while not rospy.is_shutdown() and not self.spin_server.is_preempt_requested():
+            while not rospy.is_shutdown() and not self.navigate_server.is_preempt_requested():
                 state = self.nav_client.get_state()
                 if state in [actionlib.GoalStatus.SUCCEEDED, actionlib.GoalStatus.ABORTED, actionlib.GoalStatus.REJECTED]:
                     break
-
                 rate.sleep()
 
             # Report Status
             state = self.nav_client.get_state()
-            # self.nav_client.cancel_goal()
             if state == actionlib.GoalStatus.SUCCEEDED:
                 rospy.loginfo("SUCCESS: Arrived {}m away from the object!".format(STANDOFF_DIST))
                 self.navigate_server.set_succeeded()

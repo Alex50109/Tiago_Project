@@ -27,7 +27,7 @@ METRIC_DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
 SPIN_STEP_ANGLE = 45.0
 SPIN_STEPS = 8
 QUEUE_SIZE = 8
-VLM_IMAGE_SIZE = (1280.0, 720.0)
+VLM_IMAGE_SIZE = (640.0, 480.0)
 
 class Pilot:
     def __init__(self):
@@ -47,6 +47,15 @@ class Pilot:
 
         self.spin_image_queue = queue.Queue(SPIN_STEPS)
 
+    def clear_image_queue(self):
+        # clear queue (maybe there is a better way)
+        while True:
+            try:
+                self.spin_image_queue.get_nowait()
+            except queue.Empty:
+                break
+
+
     def execute_task(self, instructions):
         target = parse_instructions_prompt(instructions)
         if target is None:
@@ -55,13 +64,7 @@ class Pilot:
 
         rospy.loginfo("Command is to go to %s (keep %s in mind)!", target["target"], target["desc"])
 
-        # clear queue (maybe there is a better way)
-        while True:
-            try:
-                self.spin_image_queue.get_nowait()
-            except queue.Empty:
-                break
-
+        self.clear_image_queue()
         # start spinning
         self.spin_client.send_goal(ControllerSpinGoal(num_pictures=SPIN_STEPS, step_angle=SPIN_STEP_ANGLE), feedback_cb=self.spin_feedback_callback)
 
@@ -154,7 +157,7 @@ class Pilot:
         # DEBUG IMAGE GENERATION: Draw Bounding Box and ROI
         # -------------------------------------------------------------
         try:
-            # 1. Decode the saved JPEG bytes back to a numpy BGR image
+            # 1. Decode the saved PNG bytes back to a numpy BGR image
             debug_rgb = cv2.imdecode(np.fromstring(found_encoded_image, np.uint8), cv2.IMREAD_COLOR)
 
             # 2. Normalize and colorize the raw hardware depth map for human viewing
@@ -202,71 +205,17 @@ class Pilot:
             depth = float(np.median(valid_hw_pixels))
             rospy.loginfo("Hardware depth acquired successfully. Object is close.")
         else:
-            rospy.loginfo("Hardware depth blind in bounding box. Calibrating AI depth...")
-
-            # Fetch AI Depth from NON-METRIC server
-            ai_depth_map = get_depth_data(found_encoded_image, url=DEPTH_SERVER_URL)
-            ai_depth_resized = cv2.resize(ai_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
-
-            # Clean NumPy approach for the whole image anchors
-            full_finite_mask = np.isfinite(hw_depth)
-
-            # Extract only the valid hardware pixels and their matching AI pixels
-            hw_finite = hw_depth[full_finite_mask]
-            ai_finite = ai_depth_resized[full_finite_mask]
-
-            # Filter by distance strictly on the finite numbers (0.5m to 3.0m)
-            dist_mask = (hw_finite > 0.5) & (hw_finite < 3.0)
-
-            hw_anchors = hw_finite[dist_mask]
-            ai_raw_anchors = ai_finite[dist_mask]
-
-            # Run regression in DISPARITY SPACE (1 / Z).
-            # Add small epsilon to prevent division by zero
-            hw_disparity_anchors = 1.0 / (hw_anchors + 1e-6)
-
-            # Perform RANSAC Regression: (1/Z_hw) = s * ai_raw + t
-            if len(hw_disparity_anchors) > 100:
-                s, t = ransac_linear_regression(ai_raw_anchors, hw_disparity_anchors, max_iters=150, threshold=0.05)
-                rospy.loginfo("Disparity calibration successful: scale={:.5f}, shift={:.5f}".format(s, t))
-            else:
-                rospy.logwarn("Not enough hardware anchors for regression. Defaulting to safe fallback.")
-                s, t = 1.0, 0.0
-
-            # Apply calibration to the raw AI depth inside the bounding box ROI
-            ai_roi_patch = ai_depth_resized[py_min:py_max, px_min:px_max]
-            ai_raw_median = float(np.median(ai_roi_patch))
-
-            # Calculate final disparity, then invert back to metric depth
-            target_disparity = float(s * ai_raw_median + t)
-
-            # Prevent division by zero if target is theoretically at infinity
-            if target_disparity <= 0.01:
-                depth = 20.0 # Cap max distance at 20m
-            else:
-                depth = 1.0 / target_disparity
-
-            rospy.loginfo("Fused AI depth calculated successfully.")
-
-            # -------------------------------------------------------------
-            # TEMPORARY COMPARISON WITH OLD METRIC SERVER
-            # -------------------------------------------------------------
+            rospy.loginfo("Hardware depth blind in bounding box. Using AI model...")
             try:
-                rospy.loginfo("Fetching uncalibrated metric model for comparison...")
+                rospy.loginfo("Fetching metric depth model data...")
                 metric_depth_map = get_depth_data(found_encoded_image, url=METRIC_DEPTH_SERVER_URL)
                 metric_depth_resized = cv2.resize(metric_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
 
                 metric_roi_patch = metric_depth_resized[py_min:py_max, px_min:px_max]
-                metric_median = float(np.median(metric_roi_patch))
+                depth = float(np.median(metric_roi_patch))
 
-                rospy.loginfo("\n================ DEPTH COMPARISON ================")
-                rospy.loginfo("1. Calibrated Non-Metric (RANSAC): {:.3f} meters".format(depth))
-                rospy.loginfo("2. Uncalibrated Metric (Raw AI)  : {:.3f} meters".format(metric_median))
-                rospy.loginfo("Absolute Difference              : {:.3f} meters".format(abs(depth - metric_median)))
-                rospy.loginfo("==================================================\n")
             except Exception as e:
-                rospy.logerr("Failed to fetch from metric server for comparison: %s", str(e))
-            # -------------------------------------------------------------
+                rospy.logerr("Failed to fetch from metric depth server: %s", str(e))
 
         rospy.loginfo("Final calculated depth: {:.2f} meters".format(depth))
 
@@ -305,11 +254,11 @@ def encode_image(img):
         new_size = (int(w * scale), int(h * scale))
         cv_img = cv2.resize(cv_img, new_size, interpolation=cv2.INTER_AREA)
 
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-    success, buffer = cv2.imencode('.jpg', cv_img, encode_params)
+    # Encode as PNG instead of JPEG to preserve quality
+    success, buffer = cv2.imencode('.png', cv_img)
 
     if not success:
-        rospy.logerr("Failed to encode image to JPEG")
+        rospy.logerr("Failed to encode image to PNG")
         return None
 
     if hasattr(buffer, 'tobytes'):
@@ -330,7 +279,7 @@ def prompt_model(text, image):
         content.append({
             "type": "image_url",
             "image_url": {
-                "url": "data:image/jpeg;base64,%s" % base64_image
+                "url": "data:image/png;base64,%s" % base64_image
             }
         })
 
@@ -430,6 +379,6 @@ if __name__ == '__main__':
     rospy.init_node('pilot_interface', anonymous=True)
 
     pilot = Pilot()
-    pilot.execute_task("Go to the sink!")
+    pilot.execute_task("Go to the big white board!")
 
     rospy.spin()
