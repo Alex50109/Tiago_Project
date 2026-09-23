@@ -169,23 +169,24 @@ class Controller:
         vel_msg = Twist()
         max_angular_speed = 1.0
 
-        while not (rospy.is_shutdown() or self.find_server.is_preempt_requested()):
-            error = normalize_angle(target_yaw - self.odom_tracker.current_yaw)
+        try:
+            while not (rospy.is_shutdown() or self.find_server.is_preempt_requested()):
+                error = normalize_angle(target_yaw - self.odom_tracker.current_yaw)
 
-            if abs(error) < 0.02:
-                break
+                if abs(error) < 0.02:
+                    break
 
-            p_speed = 0.8 * error
+                p_speed = 0.8 * error
 
-            if p_speed > 0:
-                vel_msg.angular.z = min(max(p_speed, 0.1), max_angular_speed)
-            else:
-                vel_msg.angular.z = max(min(p_speed, -0.1), -max_angular_speed)
+                if p_speed > 0:
+                    vel_msg.angular.z = min(max(p_speed, 0.1), max_angular_speed)
+                else:
+                    vel_msg.angular.z = max(min(p_speed, -0.1), -max_angular_speed)
 
-            self.cmd_pub.publish(vel_msg)
-            rate.sleep()
-
-        self.cmd_pub.publish(Twist())  # Stop moving once done
+                self.cmd_pub.publish(vel_msg)
+                rate.sleep()
+        finally:
+            self.cmd_pub.publish(Twist())  # Stop moving once done, even on shutdown
 
     def set_head_pose(self, pan, tilt):
         traj = JointTrajectory()
@@ -507,7 +508,14 @@ class Controller:
                 result.final_position = Point(target_point[0], target_point[1], 0.0)
             self.find_server.set_succeeded(result)
 
+        except rospy.ROSInterruptException:
+            rospy.logwarn("Shutting down mid-task. Stopping the robot.")
         finally:
+            try:
+                self.nav_client.cancel_goal()
+                self.cmd_pub.publish(Twist())
+            except Exception:
+                pass
             with self.state_lock:
                 self.busy = False
 

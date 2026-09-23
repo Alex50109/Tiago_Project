@@ -193,7 +193,7 @@ def prompt_model(text, image):
     request = urllib_req.Request(VLM_API_URL, data=json_data, headers=headers)
 
     try:
-        response = urllib_req.urlopen(request)
+        response = urllib_req.urlopen(request, timeout=30)
         response_data = response.read()
 
         if isinstance(response_data, bytes):
@@ -369,7 +369,7 @@ def get_depth_data(image, url=METRIC_DEPTH_SERVER_URL):
     req.add_header('Content-Type', 'application/octet-stream')
     req.add_header('Content-Length', str(len(image)))
 
-    response = urllib_req.urlopen(req)
+    response = urllib_req.urlopen(req, timeout=30)
 
     h = int(response.headers.get('X-Depth-Height'))
     w = int(response.headers.get('X-Depth-Width'))
@@ -384,6 +384,9 @@ if __name__ == '__main__':
     rospy.init_node('pilot_interface', anonymous=True)
 
     pilot = Pilot()
-    pilot.execute_task("Go to the big white board!")
+    try:
+        pilot.execute_task("Go to the big white board!")
+    except (rospy.ROSInterruptException, KeyboardInterrupt):
+        pass
 
     rospy.spin()
