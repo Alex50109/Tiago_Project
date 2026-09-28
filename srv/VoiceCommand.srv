@@ -1,0 +1,8 @@
+# Natural-language voice command received from the main client
+# (e.g. "Go to the big white board!").
+string command
+---
+# True when the pilot finished the task successfully (target reached).
+bool success
+# Human-readable result / error description.
+string message

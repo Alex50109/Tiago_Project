@@ -13,6 +13,7 @@ import numpy as np
 
 from tiago_project.msg import ControllerFindObjectAction, ControllerFindObjectGoal
 from tiago_project.msg import TargetUpdate
+from tiago_project.srv import VoiceCommand, VoiceCommandResponse
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
 
 SERVER_IP = "10.41.3.112"
@@ -124,6 +125,25 @@ class Pilot:
             # only the freshest frame matters while driving
             self.clear_image_queue()
         self.image_queue.put((feedback.image_id, feedback.image_data, feedback.depth_data))
+
+    def voice_command_service(self, request):
+        """
+        ROS service handler for /tiago/voice_command.
+
+        Blocks until the task is finished, mirroring the synchronous
+        `rosservice call` performed by the main client's ROSClient.
+        """
+        rospy.loginfo("Voice command received: %s", request.command)
+
+        try:
+            reached = self.execute_task(request.command)
+        except Exception as e:
+            rospy.logerr("Voice command failed: %s", str(e))
+            return VoiceCommandResponse(success=False, message=str(e))
+
+        if reached:
+            return VoiceCommandResponse(success=True, message="Task completed: target reached.")
+        return VoiceCommandResponse(success=False, message="Task finished, but the target was not reached.")
 
 bridge = cv_bridge.CvBridge()
 
@@ -384,9 +404,10 @@ if __name__ == '__main__':
     rospy.init_node('pilot_interface', anonymous=True)
 
     pilot = Pilot()
+    voice_service = rospy.Service('/tiago/voice_command', VoiceCommand, pilot.voice_command_service)
+    rospy.loginfo("Pilot ready! Voice command service available at /tiago/voice_command.")
+
     try:
-        pilot.execute_task("Go to the big white board!")
+        rospy.spin()
     except (rospy.ROSInterruptException, KeyboardInterrupt):
         pass
-
-    rospy.spin()
