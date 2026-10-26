@@ -19,8 +19,10 @@ from nav_msgs.msg import Odometry
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 from std_srvs.srv import Empty
+from actionlib_msgs.msg import GoalID
 
-HEAD_TILT = -0.1
+
+HEAD_TILT = -0.2
 HEAD_PAN_LIMIT = math.radians(70.0)
 HEAD_TILT_LIMITS = (math.radians(-56.0), math.radians(41.0))
 HEAD_AIM_STEP = math.radians(2.0)
@@ -52,8 +54,10 @@ class Controller:
         self.busy = False
 
         self.regoal_threshold = rospy.get_param('~regoal_threshold', 0.3)
-        self.update_wait_timeout = rospy.get_param('~update_wait_timeout', 10.0)
+        self.update_wait_timeout = rospy.get_param('~update_wait_timeout', 15.0)
         self.capture_period = rospy.get_param('~capture_period', 1.0)
+
+        rospy.on_shutdown(self.emergency_stop)
 
         self.cmd_pub = rospy.Publisher('/mobile_base_controller/cmd_vel', Twist, queue_size=10)
         self.head_pub = rospy.Publisher('/head_controller/command', JointTrajectory, queue_size=1)
@@ -74,7 +78,7 @@ class Controller:
         rospy.loginfo("Waiting for move_base...")
         self.nav_client.wait_for_server()
 
-        self.clear_costmaps_srv = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
+        self.cancel_pub = rospy.Publisher('move_base/cancel', GoalID, queue_size=10)
 
         self.camera_topic = '/xtion/rgb/image_raw'
         self.depth_topic = '/xtion/depth_registered/image_raw'
@@ -111,6 +115,19 @@ class Controller:
         self.frame_sync.registerCallback(self.frame_sync_callback)
 
         rospy.loginfo("Ready?! Vodafone!")
+
+    def emergency_stop(self):
+        """This runs securely before the ROS node is allowed to die."""
+        rospy.logwarn("EMERGENCY STOP HOOK TRIGGERED! Killing move_base...")
+        try:
+            self.cancel_pub.publish(GoalID())
+
+            stop_msg = Twist()
+            for _ in range(5):
+                self.cmd_pub.publish(stop_msg)
+                rospy.sleep(0.1)
+        except Exception as e:
+            pass
 
     def frame_sync_callback(self, rgb_msg, depth_msg):
         with self.frame_lock:
@@ -487,7 +504,6 @@ class Controller:
             self.snapshot_memory = {}
             self.next_image_id = 0
 
-            self.clear_costmaps_srv()
             self.set_head_pose(0.0, HEAD_TILT)
 
             rospy.loginfo("Starting work: {} pictures every {} deg, navigate={}.".format(
@@ -533,10 +549,12 @@ class Controller:
             rospy.logwarn("Shutting down mid-task. Stopping the robot.")
         finally:
             try:
-                self.nav_client.cancel_goal()
+                rospy.logwarn("DOSAR PENAL ACCIDENT - EMERGENCY BRAKE")
+
+                self.cancel_pub.publish(GoalID())
                 self.cmd_pub.publish(Twist())
-            except Exception:
-                pass
+            except Exception as e:
+                rospy.logwarn("Exception while cancelling goal: {}".format(e))
             with self.state_lock:
                 self.busy = False
 

@@ -16,11 +16,9 @@ from tiago_project.msg import TargetUpdate
 from tiago_project.srv import VoiceCommand, VoiceCommandResponse
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
 
-SERVER_IP = "10.41.3.112"
+SERVER_IP = "10.41.59.6"
 
-VLM_API_URL = "http://{}:8000/v1/chat/completions".format(SERVER_IP)
-
-# Port 9000 for the Metric Depth Model
+VLM_API_URL = "http://{}:1235/v1/chat/completions".format(SERVER_IP)
 METRIC_DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
 
 SPIN_STEP_ANGLE = 45.0
