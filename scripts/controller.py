@@ -55,7 +55,7 @@ class Controller:
 
         self.regoal_threshold = rospy.get_param('~regoal_threshold', 0.3)
         self.update_wait_timeout = rospy.get_param('~update_wait_timeout', 15.0)
-        self.capture_period = rospy.get_param('~capture_period', 1.0)
+        self.capture_period = rospy.get_param('~capture_period', 2.0)
 
         rospy.on_shutdown(self.emergency_stop)
 
@@ -340,6 +340,7 @@ class Controller:
         ending the scan early only when navigation was requested.
         """
         detected_point = None
+        scan_start_id = self.next_image_id
         step_angle_rad = math.radians(goal.step_angle)
         initial_yaw = self.odom_tracker.current_yaw
 
@@ -370,7 +371,7 @@ class Controller:
                 rospy.logwarn("TF Error while taking picture: {}".format(e))
 
             update = self.take_latest_update()
-            if update is not None:
+            if update is not None and update.image_id >= scan_start_id and update.depth > 0:
                 point = self.get_target_map_point(update.image_id, update.target_u, update.target_v, depth=update.depth)
                 if point[0] is not None:
                     rospy.loginfo("Target reported by pilot at image {}!".format(update.image_id))
@@ -386,7 +387,7 @@ class Controller:
 
         return 'ok', detected_point
 
-    def wait_for_first_update(self, timeout):
+    def wait_for_first_update(self, timeout, min_image_id=0):
         """
         Gives the pilot time to report a late detection after the scan has ended.
         Returns (status, target_point).
@@ -401,7 +402,7 @@ class Controller:
                 return 'preempted', None
 
             update = self.take_latest_update()
-            if update is not None:
+            if update is not None and update.image_id >= min_image_id and update.depth > 0:
                 point = self.get_target_map_point(update.image_id, update.target_u, update.target_v, depth=update.depth)
                 if point[0] is not None:
                     return 'ok', point
@@ -430,6 +431,8 @@ class Controller:
         self.nav_client.send_goal(nav_goal)
         goal_point = (nav_goal.target_pose.pose.position.x, nav_goal.target_pose.pose.position.y)
 
+        rospy.sleep(5)
+
         head_pan = 0.0
         head_tilt = HEAD_TILT
         last_capture_time = rospy.Time(0)
@@ -447,6 +450,13 @@ class Controller:
 
             update = self.take_latest_update()
             if update is not None:
+                if update.depth <= 0:
+                    rospy.logwarn("Object not detected in feedback (image {})! Stopping to re-scan...".format(update.image_id))
+                    self.nav_client.cancel_goal()
+                    self.cancel_pub.publish(GoalID())
+                    self.cmd_pub.publish(Twist())
+                    return 'lost', None, False
+
                 corrected = self.get_target_map_point(update.image_id, update.target_u, update.target_v, depth=update.depth)
                 if corrected[0] is not None:
                     target_point = corrected
@@ -499,32 +509,45 @@ class Controller:
             self.busy = True
 
         try:
-            with self.update_lock:
-                self.latest_update = None
             self.snapshot_memory = {}
             self.next_image_id = 0
-
-            self.set_head_pose(0.0, HEAD_TILT)
 
             rospy.loginfo("Starting work: {} pictures every {} deg, navigate={}.".format(
                 goal.num_pictures, goal.step_angle, goal.navigate))
 
-            status, target_point = self.scan_phase(goal)
-            if status == 'preempted':
-                self.find_server.set_preempted()
-                return
+            reached_final = False
+            target_point = None
 
-            if goal.navigate and target_point is None:
-                status, target_point = self.wait_for_first_update(self.update_wait_timeout)
+            while not rospy.is_shutdown():
+                with self.update_lock:
+                    self.latest_update = None
+
+                self.set_head_pose(0.0, HEAD_TILT)
+
+                scan_start_id = self.next_image_id
+                status, target_point = self.scan_phase(goal)
                 if status == 'preempted':
                     self.find_server.set_preempted()
                     return
 
-            if goal.navigate and target_point is not None:
+                if goal.navigate and target_point is None:
+                    status, target_point = self.wait_for_first_update(
+                        self.update_wait_timeout, min_image_id=scan_start_id
+                    )
+                    if status == 'preempted':
+                        self.find_server.set_preempted()
+                        return
+
+                if not goal.navigate or target_point is None:
+                    break
+
                 status, target_point, reached = self.navigate_phase(target_point)
                 if status == 'preempted':
                     self.find_server.set_preempted()
                     return
+                if status == 'lost':
+                    rospy.loginfo("Re-running find object scan loop...")
+                    continue
                 if status == 'aborted':
                     result = ControllerFindObjectResult()
                     result.target_found = True
@@ -533,8 +556,7 @@ class Controller:
                     self.find_server.set_aborted(result)
                     return
                 reached_final = reached
-            else:
-                reached_final = False
+                break
 
             rospy.loginfo("Work is done here! Me no busy!")
 

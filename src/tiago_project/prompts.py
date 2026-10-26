@@ -14,22 +14,22 @@ RULES:
 4. If the command does NOT involve moving to a physical location, or no physical location can be identified, set "is_navigation" to false and set both "location" and "description" to null.
 
 Examples:
-Input: "Du-te la sala principală de conferințe (cea cu uși de sticlă)."
+Input: "Du-te la sala principala de conferinte (cea cu usi de sticla)."
 Output: {{"is_navigation": true, "location": "main conference room", "description": "with the glass doors"}}
 
-Input: "Scanează acest document la imprimantă."
+Input: "Scaneaza acest document la imprimanta."
 Output: {{"is_navigation": false, "location": null, "description": null}}
 
-Input: "Mergi la biroul Alicei (caută monitoarele duble)."
+Input: "Mergi la biroul Alicei (cauta monitoarele duble)."
 Output: {{"is_navigation": true, "location": "Alice's desk", "description": "look for dual monitors"}}
 
-Input: "Navighează către camera de pauză de lângă lifturile din nord."
+Input: "Navigheaza catre camera de pauza de langa lifturile din nord."
 Output: {{"is_navigation": true, "location": "breakroom", "description": "by the north elevators"}}
 
-Input: "Pot robotul să meargă la bucătărie, te rog?"
+Input: "Pot robotul sa mearga la bucatarie, te rog?"
 Output: {{"is_navigation": true, "location": "kitchen", "description": null}}
 
-Input: "Te rog oprește și așteaptă aici."
+Input: "Te rog opreste si asteapta aici."
 Output: {{"is_navigation": false, "location": null, "description": null}}
 
 Input: "{}"
