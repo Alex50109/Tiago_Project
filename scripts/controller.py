@@ -51,11 +51,11 @@ class Controller:
     def __init__(self):
         self.state_lock = threading.Lock()
         self.update_lock = threading.Lock()
-        self.busy = False
 
         self.regoal_threshold = rospy.get_param('~regoal_threshold', 0.3)
         self.update_wait_timeout = rospy.get_param('~update_wait_timeout', 15.0)
         self.capture_period = rospy.get_param('~capture_period', 2.0)
+        self.initial_capture_delay = rospy.get_param('~initial_capture_delay', 3.0)
 
         rospy.on_shutdown(self.emergency_stop)
 
@@ -349,6 +349,8 @@ class Controller:
                 rospy.loginfo("Scan preempted!")
                 return 'preempted', None
 
+            self.set_head_pose(0.0, HEAD_TILT)
+
             # Pause for 1 second to let the camera physically stabilize before the next shot
             rospy.sleep(1.0)
 
@@ -431,7 +433,7 @@ class Controller:
         self.nav_client.send_goal(nav_goal)
         goal_point = (nav_goal.target_pose.pose.position.x, nav_goal.target_pose.pose.position.y)
 
-        rospy.sleep(5)
+        rospy.sleep(self.initial_capture_delay)
 
         head_pan = 0.0
         head_tilt = HEAD_TILT
@@ -460,24 +462,25 @@ class Controller:
                 corrected = self.get_target_map_point(update.image_id, update.target_u, update.target_v, depth=update.depth)
                 if corrected[0] is not None:
                     target_point = corrected
-                    robot_x, robot_y, _ = self.get_robot_pose()
-                    if robot_x is not None:
-                        if math.hypot(target_point[0] - robot_x, target_point[1] - robot_y) <= STANDOFF_DIST:
-                            rospy.loginfo("Corrected target is within {}m. Stopping here.".format(STANDOFF_DIST))
-                            self.nav_client.cancel_goal()
-                            return 'ok', target_point, True
-
-                        shift = math.hypot(target_point[0] - goal_point[0], target_point[1] - goal_point[1])
-                        if shift > self.regoal_threshold:
-                            rospy.loginfo("Target shifted by {:.2f}m! Re-goal!".format(shift))
-                            nav_goal = self.build_move_base_goal(target_point[0], target_point[1], robot_x, robot_y)
-                            self.nav_client.cancel_goal()
-                            self.nav_client.send_goal(nav_goal)
-                            goal_point = (nav_goal.target_pose.pose.position.x, nav_goal.target_pose.pose.position.y)
+                    shift = math.hypot(target_point[0] - goal_point[0], target_point[1] - goal_point[1])
+                    if shift > self.regoal_threshold:
+                        rospy.loginfo("Target shifted by {:.2f}m! Re-goal!".format(shift))
+                        nav_goal = self.build_move_base_goal(target_point[0], target_point[1], robot_x, robot_y)
+                        self.nav_client.cancel_goal()
+                        self.nav_client.send_goal(nav_goal)
+                        goal_point = (nav_goal.target_pose.pose.position.x, nav_goal.target_pose.pose.position.y)
                 else:
                     rospy.logwarn("Target update referenced unknown image {}.".format(update.image_id))
 
+            robot_x, robot_y, _ = self.get_robot_pose()
+            if robot_x is not None:
+                if math.hypot(target_point[0] - robot_x, target_point[1] - robot_y) <= STANDOFF_DIST:
+                    rospy.loginfo("Corrected target is within {}m. Stopping here.".format(STANDOFF_DIST))
+                    self.nav_client.cancel_goal()
+                    return 'ok', target_point, True
+
             head_pan, head_tilt = self.aim_head_at_map_point(target_point, head_pan, head_tilt)
+            self.set_head_pose(head_pan, head_tilt)
 
             now = rospy.Time.now()
             if (now - last_capture_time).to_sec() >= self.capture_period:
@@ -501,13 +504,6 @@ class Controller:
         return 'aborted', target_point, reached
 
     def find_callback(self, goal):
-        with self.state_lock:
-            if self.busy:
-                rospy.logwarn("Me busy!!! Stop bothering!")
-                self.find_server.set_aborted()
-                return
-            self.busy = True
-
         try:
             self.snapshot_memory = {}
             self.next_image_id = 0
@@ -521,8 +517,6 @@ class Controller:
             while not rospy.is_shutdown():
                 with self.update_lock:
                     self.latest_update = None
-
-                self.set_head_pose(0.0, HEAD_TILT)
 
                 scan_start_id = self.next_image_id
                 status, target_point = self.scan_phase(goal)
@@ -571,15 +565,10 @@ class Controller:
             rospy.logwarn("Shutting down mid-task. Stopping the robot.")
         finally:
             try:
-                rospy.logwarn("DOSAR PENAL ACCIDENT - EMERGENCY BRAKE")
-
                 self.cancel_pub.publish(GoalID())
                 self.cmd_pub.publish(Twist())
             except Exception as e:
                 rospy.logwarn("Exception while cancelling goal: {}".format(e))
-            with self.state_lock:
-                self.busy = False
-
 
 if __name__ == '__main__':
     rospy.init_node('controller', anonymous=True)

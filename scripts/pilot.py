@@ -317,10 +317,10 @@ def compute_object_depth(depth_data, encoded_image, box):
     # DEBUG IMAGE GENERATION: Draw Bounding Box and ROI
     # -------------------------------------------------------------
     try:
-        # 1. Decode the saved PNG bytes back to a numpy BGR image
+        # Decode the saved PNG bytes back to a numpy BGR image
         debug_rgb = cv2.imdecode(np.fromstring(encoded_image, np.uint8), cv2.IMREAD_COLOR)
 
-        # 2. Normalize and colorize the raw hardware depth map for human viewing
+        # Normalize and colorize the raw hardware depth map for human viewing
         # Clip depth to 5 meters for better contrast, then scale to 0-255
         depth_clipped = np.clip(hw_depth, 0, 5.0)
         depth_normalized = ((depth_clipped / 5.0) * 255.0).astype(np.uint8)
