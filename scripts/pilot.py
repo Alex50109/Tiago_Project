@@ -16,15 +16,6 @@ from tiago_project.msg import TargetUpdate
 from tiago_project.srv import VoiceCommand, VoiceCommandResponse
 from tiago_project.prompts import prompt_instruction_parser, prompt_object_detection
 
-SERVER_IP = "10.41.59.6"
-
-VLM_API_URL = "http://{}:1235/v1/chat/completions".format(SERVER_IP)
-METRIC_DEPTH_SERVER_URL = "http://{}:9000/predict_depth_raw".format(SERVER_IP)
-
-SPIN_STEP_ANGLE = 45.0
-SPIN_STEPS = 8
-VLM_IMAGE_SIZE = (640.0, 480.0)
-
 TERMINAL_GOAL_STATES = [
     actionlib.GoalStatus.SUCCEEDED,
     actionlib.GoalStatus.ABORTED,
@@ -35,6 +26,16 @@ TERMINAL_GOAL_STATES = [
 
 class Pilot:
     def __init__(self):
+        self.server_ip = rospy.get_param('~server_ip', "10.41.59.6")
+        self.vlm_api_url = "http://{}:1235/v1/chat/completions".format(self.server_ip)
+        self.metric_depth_server_url = "http://{}:9000/predict_depth_raw".format(self.server_ip)
+        self.spin_step_angle = rospy.get_param('~spin_step_angle_deg', 45.0)
+        self.spin_steps = 360.0 / self.spin_step_angle
+        self.vlm_image_size = (
+            rospy.get_param('~vlm_image_width', 640.0),
+            rospy.get_param('~vlm_image_height', 480.0),
+        )
+
         self.find_client = actionlib.SimpleActionClient('find_object', ControllerFindObjectAction)
         self.update_pub = rospy.Publisher('/target_update', TargetUpdate, queue_size=1)
 
@@ -44,7 +45,7 @@ class Pilot:
 
         rospy.loginfo("Controller linked. Ready to command!")
 
-        self.image_queue = queue.Queue(SPIN_STEPS)
+        self.image_queue = queue.Queue(self.spin_steps)
 
     def clear_image_queue(self):
         # clear queue (maybe there is a better way)
@@ -55,7 +56,7 @@ class Pilot:
                 break
 
     def execute_task(self, instructions):
-        target = parse_instructions_prompt(instructions)
+        target = parse_instructions_prompt(instructions, api_url=self.vlm_api_url)
         if target is None:
             rospy.logerr("Not an interesting command! I have the right to ignore you!")
             return False
@@ -64,7 +65,7 @@ class Pilot:
 
         self.clear_image_queue()
         self.find_client.send_goal(
-            ControllerFindObjectGoal(num_pictures=SPIN_STEPS, step_angle=SPIN_STEP_ANGLE, navigate=True),
+            ControllerFindObjectGoal(num_pictures=self.spin_steps, step_angle=self.spin_step_angle, navigate=True),
             feedback_cb=self.feedback_callback
         )
 
@@ -79,18 +80,23 @@ class Pilot:
             except queue.Empty:
                 continue
 
-            encoded_image = encode_image(image_data)
+            encoded_image = encode_image(image_data, image_size=self.vlm_image_size)
             if encoded_image is None:
                 continue
 
             rospy.loginfo("Prompting picture %d!", image_id + 1)
-            detections = detect_targets_in_image(target, encoded_image)
+            detections = detect_targets_in_image(target, encoded_image, api_url=self.vlm_api_url)
             rospy.loginfo("LLM returned: %s", detections)
 
             if not detections:
                 continue
 
-            depth = compute_object_depth(depth_data, encoded_image, detections[0]["box"])
+            depth = compute_object_depth(
+                depth_data,
+                encoded_image,
+                detections[0]["box"],
+                depth_url=self.metric_depth_server_url
+            )
             if depth is None:
                 rospy.logwarn("Depth estimation failed for picture %d. Trying the next frame.", image_id + 1)
                 continue
@@ -145,7 +151,7 @@ class Pilot:
 
 bridge = cv_bridge.CvBridge()
 
-def encode_image(img):
+def encode_image(img, image_size):
     try:
         cv_img = bridge.imgmsg_to_cv2(img, desired_encoding="bgr8")
     except cv_bridge.CvBridgeError as e:
@@ -153,7 +159,7 @@ def encode_image(img):
         return None
 
     h, w = cv_img.shape[:2]
-    max_w, max_h = VLM_IMAGE_SIZE
+    max_w, max_h = image_size
 
     scale = min(max_w / w, max_h / h)
 
@@ -175,7 +181,7 @@ def encode_image(img):
 
     return raw_bytes
 
-def prompt_model(text, image):
+def prompt_model(text, image, api_url):
     content = [{"type": "text", "text": text}]
 
     if image is not None:
@@ -208,7 +214,7 @@ def prompt_model(text, image):
     }
 
     json_data = json.dumps(payload).encode("utf-8")
-    request = urllib_req.Request(VLM_API_URL, data=json_data, headers=headers)
+    request = urllib_req.Request(api_url, data=json_data, headers=headers)
 
     try:
         response = urllib_req.urlopen(request, timeout=30)
@@ -224,8 +230,8 @@ def prompt_model(text, image):
         rospy.logerr("Failed to query model: %s" % str(e))
         return ""
 
-def parse_instructions_prompt(prompt):
-    reply = prompt_model(prompt_instruction_parser.format(prompt), None)
+def parse_instructions_prompt(prompt, api_url):
+    reply = prompt_model(prompt_instruction_parser.format(prompt), None, api_url=api_url)
 
     try:
         command_data = json.loads(reply.strip())
@@ -250,8 +256,8 @@ def parse_instructions_prompt(prompt):
 
     return None
 
-def detect_targets_in_image(instructions, image):
-    reply = prompt_model(prompt_object_detection.format(instructions["target"], instructions["desc"]), image)
+def detect_targets_in_image(instructions, image, api_url):
+    reply = prompt_model(prompt_object_detection.format(instructions["target"], instructions["desc"]), image, api_url=api_url)
     try:
         items = []
         for item in json.loads(reply.strip()):
@@ -280,7 +286,7 @@ def detection_center(box):
     u_min, v_min, u_max, v_max = normalize_box(box)
     return (u_min + u_max) / 2.0, (v_min + v_max) / 2.0
 
-def compute_object_depth(depth_data, encoded_image, box):
+def compute_object_depth(depth_data, encoded_image, box, depth_url):
     """
     Median depth of the object's central bounding box ROI, measured with the
     hardware depth camera or, when the hardware is blind, with the metric AI model.
@@ -313,9 +319,7 @@ def compute_object_depth(depth_data, encoded_image, box):
     py_min = max(0, int(roi_v_min * (hw_h - 1)))
     py_max = min(hw_h, max(py_min + 1, int(roi_v_max * (hw_h - 1))))
 
-    # -------------------------------------------------------------
     # DEBUG IMAGE GENERATION: Draw Bounding Box and ROI
-    # -------------------------------------------------------------
     try:
         # Decode the saved PNG bytes back to a numpy BGR image
         debug_rgb = cv2.imdecode(np.fromstring(encoded_image, np.uint8), cv2.IMREAD_COLOR)
@@ -347,7 +351,6 @@ def compute_object_depth(depth_data, encoded_image, box):
 
     except Exception as e:
         rospy.logerr("Failed to generate debug images: %s", str(e))
-    # -------------------------------------------------------------
 
     hw_roi_patch = hw_depth[py_min:py_max, px_min:px_max]
 
@@ -368,7 +371,7 @@ def compute_object_depth(depth_data, encoded_image, box):
         rospy.loginfo("Hardware depth blind in bounding box. Using AI model...")
         try:
             rospy.loginfo("Fetching metric depth model data...")
-            metric_depth_map = get_depth_data(encoded_image, url=METRIC_DEPTH_SERVER_URL)
+            metric_depth_map = get_depth_data(encoded_image, url=depth_url)
             metric_depth_resized = cv2.resize(metric_depth_map, (hw_w, hw_h), interpolation=cv2.INTER_NEAREST)
 
             metric_roi_patch = metric_depth_resized[py_min:py_max, px_min:px_max]
@@ -382,7 +385,7 @@ def compute_object_depth(depth_data, encoded_image, box):
 
     return depth
 
-def get_depth_data(image, url=METRIC_DEPTH_SERVER_URL):
+def get_depth_data(image, url):
     req = urllib_req.Request(url, data=image)
     req.add_header('Content-Type', 'application/octet-stream')
     req.add_header('Content-Length', str(len(image)))

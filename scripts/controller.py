@@ -22,12 +22,6 @@ from std_srvs.srv import Empty
 from actionlib_msgs.msg import GoalID
 
 
-HEAD_TILT = -0.2
-HEAD_PAN_LIMIT = math.radians(70.0)
-HEAD_TILT_LIMITS = (math.radians(-56.0), math.radians(41.0))
-HEAD_AIM_STEP = math.radians(2.0)
-STANDOFF_DIST = 0.5
-
 class OdomTracker:
     def __init__(self):
         self.current_yaw = None
@@ -52,6 +46,14 @@ class Controller:
         self.state_lock = threading.Lock()
         self.update_lock = threading.Lock()
 
+        self.head_tilt = rospy.get_param('~head_tilt', -0.2)
+        self.head_pan_limit = math.radians(rospy.get_param('~head_pan_limit_deg', 70.0))
+        self.head_tilt_limits = (
+            math.radians(rospy.get_param('~head_tilt_min_deg', -56.0)),
+            math.radians(rospy.get_param('~head_tilt_max_deg', 41.0)),
+        )
+        self.head_aim_step = math.radians(rospy.get_param('~head_aim_step_deg', 2.0))
+        self.standoff_dist = rospy.get_param('~standoff_dist', 0.5)
         self.regoal_threshold = rospy.get_param('~regoal_threshold', 0.3)
         self.update_wait_timeout = rospy.get_param('~update_wait_timeout', 15.0)
         self.capture_period = rospy.get_param('~capture_period', 2.0)
@@ -241,12 +243,12 @@ class Controller:
         base_dy = sin_yaw * dx + cos_yaw * dy
         base_dz = dz
 
-        pan = max(min(math.atan2(base_dy, base_dx), HEAD_PAN_LIMIT), -HEAD_PAN_LIMIT)
+        pan = max(min(math.atan2(base_dy, base_dx), self.head_pan_limit), -self.head_pan_limit)
         tilt = max(min(math.atan2(base_dz, math.hypot(base_dx, base_dy)),
-                       HEAD_TILT_LIMITS[1]), HEAD_TILT_LIMITS[0])
+                       self.head_tilt_limits[1]), self.head_tilt_limits[0])
 
-        if abs(normalize_angle(pan - current_pan)) >= HEAD_AIM_STEP or \
-                abs(normalize_angle(tilt - current_tilt)) >= HEAD_AIM_STEP:
+        if abs(normalize_angle(pan - current_pan)) >= self.head_aim_step or \
+                abs(normalize_angle(tilt - current_tilt)) >= self.head_aim_step:
             self.set_head_pose(pan, tilt)
             return pan, tilt
         return current_pan, current_tilt
@@ -313,8 +315,8 @@ class Controller:
         dy = target_y - robot_y
         yaw_angle = math.atan2(dy, dx)
 
-        goal_x = target_x - (STANDOFF_DIST * math.cos(yaw_angle))
-        goal_y = target_y - (STANDOFF_DIST * math.sin(yaw_angle))
+        goal_x = target_x - (self.standoff_dist * math.cos(yaw_angle))
+        goal_y = target_y - (self.standoff_dist * math.sin(yaw_angle))
 
         rospy.loginfo("Object at ({:.2f}, {:.2f}). Driving to safe standoff at ({:.2f}, {:.2f})...".format(
             target_x, target_y, goal_x, goal_y))
@@ -337,19 +339,22 @@ class Controller:
         """
         Rotates in place and streams pictures to the pilot.
         Returns (status, target_point): the point comes from the first pilot update,
-        ending the scan early only when navigation was requested.
+        ending the scan early only when no odom data is available or a
+        navigation was requested.
         """
         detected_point = None
         scan_start_id = self.next_image_id
         step_angle_rad = math.radians(goal.step_angle)
         initial_yaw = self.odom_tracker.current_yaw
+        if initial_yaw is None:
+            return 'aborted', None
 
         for i in range(goal.num_pictures):
             if self.find_server.is_preempt_requested():
                 rospy.loginfo("Scan preempted!")
                 return 'preempted', None
 
-            self.set_head_pose(0.0, HEAD_TILT)
+            self.set_head_pose(0.0, self.head_tilt)
 
             # Pause for 1 second to let the camera physically stabilize before the next shot
             rospy.sleep(1.0)
@@ -425,8 +430,8 @@ class Controller:
         if robot_x is None:
             return 'aborted', target_point, reached
 
-        if math.hypot(target_point[0] - robot_x, target_point[1] - robot_y) <= STANDOFF_DIST:
-            rospy.loginfo("Robot is already within {}m of the target.".format(STANDOFF_DIST))
+        if math.hypot(target_point[0] - robot_x, target_point[1] - robot_y) <= self.standoff_dist:
+            rospy.loginfo("Robot is already within {}m of the target.".format(self.standoff_dist))
             return 'ok', target_point, True
 
         nav_goal = self.build_move_base_goal(target_point[0], target_point[1], robot_x, robot_y)
@@ -436,7 +441,7 @@ class Controller:
         rospy.sleep(self.initial_capture_delay)
 
         head_pan = 0.0
-        head_tilt = HEAD_TILT
+        head_tilt = self.head_tilt
         last_capture_time = rospy.Time(0)
         rate = rospy.Rate(5)
 
@@ -474,8 +479,8 @@ class Controller:
 
             robot_x, robot_y, _ = self.get_robot_pose()
             if robot_x is not None:
-                if math.hypot(target_point[0] - robot_x, target_point[1] - robot_y) <= STANDOFF_DIST:
-                    rospy.loginfo("Corrected target is within {}m. Stopping here.".format(STANDOFF_DIST))
+                if math.hypot(target_point[0] - robot_x, target_point[1] - robot_y) <= self.standoff_dist:
+                    rospy.loginfo("Corrected target is within {}m. Stopping here.".format(self.standoff_dist))
                     self.nav_client.cancel_goal()
                     return 'ok', target_point, True
 
@@ -497,7 +502,7 @@ class Controller:
 
         state = self.nav_client.get_state()
         if state == actionlib.GoalStatus.SUCCEEDED:
-            rospy.loginfo("SUCCESS: Arrived {}m away from the object!".format(STANDOFF_DIST))
+            rospy.loginfo("SUCCESS: Arrived {}m away from the object!".format(self.standoff_dist))
             return 'ok', target_point, True
 
         rospy.logwarn("FAILED: Target is blocked or unreachable (State code: {}).".format(state))
